@@ -29,6 +29,12 @@ Lithos is an MCP server that provides a shared knowledge store for AI agents run
 claude mcp add --transport sse lithos http://localhost:8765/sse
 ```
 
+## Documentation
+
+- [CLI Reference](docs/cli.md) — installing and using the `lithos` command-line tool
+- [Specification](docs/SPECIFICATION.md) — full technical specification
+- [LCMA Design](docs/lcma-design.md) — design notes
+
 ## Tech Stack
 
 | Component | Technology |
