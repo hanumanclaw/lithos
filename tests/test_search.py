@@ -3,6 +3,7 @@
 import pytest
 
 from lithos.knowledge import KnowledgeManager
+from lithos.errors import IndexingError, SearchBackendError
 from lithos.search import (
     SearchEngine,
     chunk_text,
@@ -413,36 +414,64 @@ class TestSearchEngineIntegration:
 
 
 class TestSearchEngineResiliency:
-    """Tests for graceful error handling in SearchEngine."""
+    """Tests for error propagation and partial-failure handling in SearchEngine."""
 
     @pytest.mark.asyncio
-    async def test_full_text_search_returns_empty_on_backend_error(
+    async def test_full_text_search_raises_on_backend_error(
         self, knowledge_manager: KnowledgeManager, search_engine: SearchEngine
     ):
-        """full_text_search returns [] rather than raising when Tantivy errors."""
+        """full_text_search raises SearchBackendError when Tantivy errors.
 
-        # Monkeypatch the underlying tantivy search to simulate a backend failure
+        Callers must be able to distinguish a backend failure from an empty
+        result set; silent swallowing of exceptions is not acceptable.
+        """
+
         def _boom(*args, **kwargs):
             raise RuntimeError("simulated tantivy failure")
 
         search_engine.tantivy.search = _boom  # type: ignore[method-assign]
 
-        results = search_engine.full_text_search("anything")
-        assert results == []
+        with pytest.raises(SearchBackendError) as exc_info:
+            search_engine.full_text_search("anything")
+
+        assert "tantivy" in exc_info.value.backend_errors
+        assert isinstance(exc_info.value.backend_errors["tantivy"], RuntimeError)
 
     @pytest.mark.asyncio
-    async def test_semantic_search_returns_empty_on_backend_error(
+    async def test_semantic_search_raises_on_backend_error(
         self, knowledge_manager: KnowledgeManager, search_engine: SearchEngine
     ):
-        """semantic_search returns [] rather than raising when ChromaDB errors."""
+        """semantic_search raises SearchBackendError when ChromaDB errors.
+
+        Callers must be able to distinguish a backend failure from an empty
+        result set; silent swallowing of exceptions is not acceptable.
+        """
 
         def _boom(*args, **kwargs):
             raise RuntimeError("simulated chroma failure")
 
         search_engine.chroma.search = _boom  # type: ignore[method-assign]
 
-        results = search_engine.semantic_search("anything")
-        assert results == []
+        with pytest.raises(SearchBackendError) as exc_info:
+            search_engine.semantic_search("anything")
+
+        assert "chroma" in exc_info.value.backend_errors
+        assert isinstance(exc_info.value.backend_errors["chroma"], RuntimeError)
+
+    @pytest.mark.asyncio
+    async def test_search_backend_error_is_lithos_error(
+        self, search_engine: SearchEngine
+    ):
+        """SearchBackendError is a subclass of LithosError for broad catching."""
+        from lithos.errors import LithosError
+
+        def _boom(*args, **kwargs):
+            raise RuntimeError("boom")
+
+        search_engine.tantivy.search = _boom  # type: ignore[method-assign]
+
+        with pytest.raises(LithosError):
+            search_engine.full_text_search("anything")
 
     @pytest.mark.asyncio
     async def test_index_document_partial_failure_does_not_raise(
@@ -464,6 +493,69 @@ class TestSearchEngineResiliency:
         chunks = search_engine.index_document(doc)
         # Chroma still works, so chunks > 0
         assert chunks >= 1
+
+    @pytest.mark.asyncio
+    async def test_index_document_total_failure_raises(
+        self, knowledge_manager: KnowledgeManager, search_engine: SearchEngine
+    ):
+        """index_document raises IndexingError when every backend fails."""
+
+        def _boom(*args, **kwargs):
+            raise RuntimeError("simulated failure")
+
+        search_engine.tantivy.add_document = _boom  # type: ignore[method-assign]
+        search_engine.chroma.add_document = _boom  # type: ignore[method-assign]
+
+        doc = await knowledge_manager.create(
+            title="Total Failure Test",
+            content="Both backends will fail for this document.",
+            agent="test-agent",
+        )
+
+        with pytest.raises(IndexingError) as exc_info:
+            search_engine.index_document(doc)
+
+        assert "tantivy" in exc_info.value.backend_errors
+        assert "chroma" in exc_info.value.backend_errors
+
+    @pytest.mark.asyncio
+    async def test_remove_document_partial_failure_does_not_raise(
+        self, knowledge_manager: KnowledgeManager, search_engine: SearchEngine
+    ):
+        """remove_document logs and continues when one backend fails."""
+
+        def _boom(*args, **kwargs):
+            raise RuntimeError("simulated failure")
+
+        search_engine.tantivy.remove_document = _boom  # type: ignore[method-assign]
+
+        doc = await knowledge_manager.create(
+            title="Remove Partial Failure",
+            content="One backend will fail during removal.",
+            agent="test-agent",
+        )
+        search_engine.index_document(doc)
+
+        # Should not raise even though Tantivy remove is broken
+        search_engine.remove_document(doc.id)  # no exception
+
+    @pytest.mark.asyncio
+    async def test_remove_document_total_failure_raises(
+        self, knowledge_manager: KnowledgeManager, search_engine: SearchEngine
+    ):
+        """remove_document raises IndexingError when every backend fails."""
+
+        def _boom(*args, **kwargs):
+            raise RuntimeError("simulated failure")
+
+        search_engine.tantivy.remove_document = _boom  # type: ignore[method-assign]
+        search_engine.chroma.remove_document = _boom  # type: ignore[method-assign]
+
+        with pytest.raises(IndexingError) as exc_info:
+            search_engine.remove_document("fake-doc-id")
+
+        assert "tantivy" in exc_info.value.backend_errors
+        assert "chroma" in exc_info.value.backend_errors
 
     def test_health_returns_ok_when_backends_available(self, search_engine: SearchEngine):
         """health() reports ok for both backends when they are up."""

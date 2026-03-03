@@ -11,6 +11,7 @@ import tantivy
 from sentence_transformers import SentenceTransformer
 
 from lithos.config import LithosConfig, get_config
+from lithos.errors import IndexingError, SearchBackendError
 from lithos.knowledge import KnowledgeDocument
 
 logger = logging.getLogger(__name__)
@@ -575,15 +576,23 @@ class SearchEngine:
     def index_document(self, doc: KnowledgeDocument) -> int:
         """Index a document in both search engines.
 
+        Partial failures (one backend succeeds) are logged as warnings.
+        If *both* backends fail the operation is considered a total failure and
+        ``IndexingError`` is raised.
+
         Returns:
-            Number of chunks created for semantic search. Returns 0 if a
-            backend is unavailable; partial failures are logged but do not
-            raise so that the caller can continue.
+            Number of chunks created for semantic search.
+
+        Raises:
+            IndexingError: If every backend failed to index the document.
         """
+        errors: dict[str, Exception] = {}
+
         try:
             self.tantivy.add_document(doc)
         except Exception as exc:
             logger.warning("Full-text indexing failed for doc %s: %s", doc.id, exc)
+            errors["tantivy"] = exc
 
         chunks = 0
         try:
@@ -594,20 +603,44 @@ class SearchEngine:
             )
         except Exception as exc:
             logger.warning("Semantic indexing failed for doc %s: %s", doc.id, exc)
+            errors["chroma"] = exc
+
+        if len(errors) == 2:
+            raise IndexingError(
+                f"All backends failed to index document {doc.id!r}",
+                errors,
+            )
 
         return chunks
 
     def remove_document(self, doc_id: str) -> None:
-        """Remove a document from both search engines."""
+        """Remove a document from both search engines.
+
+        Partial failures (one backend succeeds) are logged as warnings.
+        If *both* backends fail, ``IndexingError`` is raised.
+
+        Raises:
+            IndexingError: If every backend failed to remove the document.
+        """
+        errors: dict[str, Exception] = {}
+
         try:
             self.tantivy.remove_document(doc_id)
         except Exception as exc:
             logger.warning("Full-text removal failed for doc %s: %s", doc_id, exc)
+            errors["tantivy"] = exc
 
         try:
             self.chroma.remove_document(doc_id)
         except Exception as exc:
             logger.warning("Semantic removal failed for doc %s: %s", doc_id, exc)
+            errors["chroma"] = exc
+
+        if len(errors) == 2:
+            raise IndexingError(
+                f"All backends failed to remove document {doc_id!r}",
+                errors,
+            )
 
     def full_text_search(
         self,
@@ -619,7 +652,10 @@ class SearchEngine:
     ) -> list[SearchResult]:
         """Full-text search using Tantivy.
 
-        Returns an empty list if Tantivy is unavailable, rather than raising.
+        Raises:
+            SearchBackendError: If the Tantivy backend raises an exception.
+                An empty result list means *no documents matched*; this error
+                means the query could not be executed at all.
         """
         try:
             return self.tantivy.search(
@@ -630,8 +666,11 @@ class SearchEngine:
                 path_prefix=path_prefix,
             )
         except Exception as exc:
-            logger.warning("Full-text search unavailable: %s", exc)
-            return []
+            logger.error("Full-text search failed: %s", exc)
+            raise SearchBackendError(
+                "Full-text search backend (tantivy) failed",
+                {"tantivy": exc},
+            ) from exc
 
     def semantic_search(
         self,
@@ -642,7 +681,10 @@ class SearchEngine:
     ) -> list[SemanticResult]:
         """Semantic search using ChromaDB.
 
-        Returns an empty list if ChromaDB is unavailable, rather than raising.
+        Raises:
+            SearchBackendError: If the ChromaDB backend raises an exception.
+                An empty result list means *no documents matched*; this error
+                means the query could not be executed at all.
         """
         if threshold is None:
             threshold = self.config.search.semantic_threshold
@@ -654,8 +696,11 @@ class SearchEngine:
                 tags=tags,
             )
         except Exception as exc:
-            logger.warning("Semantic search unavailable: %s", exc)
-            return []
+            logger.error("Semantic search failed: %s", exc)
+            raise SearchBackendError(
+                "Semantic search backend (chroma) failed",
+                {"chroma": exc},
+            ) from exc
 
     def clear_all(self) -> None:
         """Clear all indices."""
