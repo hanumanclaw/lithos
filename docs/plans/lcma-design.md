@@ -1,5 +1,7 @@
 # LCMA Design Doc
 
+Contract note: write-path request/response semantics referenced here are governed by `unified-write-contract.md`. System-level rollout and compatibility guardrails are governed by `final-architecture-guardrails.md`.
+
 ## 0. Summary
 
 LCMA turns Lithos from “notes + embeddings” into a **cognitive substrate**:
@@ -66,6 +68,12 @@ LCMA edge fields:
 - `weight` (float)
 - `provenance` (who created it: user/agent/rule — mirrors the `author`/`contributors` pattern on notes)
 - `evidence` (anchors/snippets)
+
+Provenance authority rule (cross-plan consistency):
+
+- Canonical declared lineage is `derived_from_ids` in note frontmatter (Digest Auto-Link v2).
+- `edges.db` may mirror lineage as `type="derived_from"` for retrieval/ranking performance, but this is a projection.
+- If frontmatter and `edges.db` diverge, frontmatter is authoritative and projection must be repaired/rebuilt.
 
 ### Concept Node (emergent)
 
@@ -268,7 +276,7 @@ This is intentionally “minimum viable” while supporting v1 + v2.
 
 ## 4.1 Directory Layout
 
-The existing Lithos directory structure is preserved. LCMA consolidates all SQLite databases under `data/.lithos/` (coordination.db is moved from `data/` root; see migration note in §6 MVP 1).
+The existing Lithos directory structure is preserved. LCMA consolidates all SQLite databases under `data/.lithos/`. `coordination.db` is already migrated by current code and should not be re-migrated in LCMA work.
 
 ```
 data/                              # configurable via StorageConfig.data_dir
@@ -280,7 +288,7 @@ data/                              # configurable via StorageConfig.data_dir
   .chroma/                         # existing: ChromaDB embeddings (all-MiniLM-L6-v2)
   .graph/                          # existing: NetworkX wiki-link graph (pickle)
   .lithos/                         # SQLite stores + LCMA data
-    coordination.db                #   agents, tasks, claims, findings (moved from data/ root)
+    coordination.db                #   agents, tasks, claims, findings
     edges.db                       #   typed weighted edges (separate from NetworkX)
     stats.db                       #   usage stats, salience, decay
     receipts.jsonl                 #   Auditor logs
@@ -947,15 +955,15 @@ Migrations must be idempotent and never remove existing fields.
 
 # 6) MVP Roadmap (so this doesn’t explode)
 
-Each MVP builds on the existing Lithos infrastructure. Existing tools are extended with backward-compatible optional parameters (e.g., `lithos_write` gains optional `note_type`, `namespace`, `access_scope` params with defaults that preserve current behavior). No existing parameters, return formats, or behaviors are changed.
+Each MVP builds on the existing Lithos infrastructure. Existing tools are extended with backward-compatible optional parameters (e.g., `lithos_write` gains optional `note_type`, `namespace`, `access_scope` params with defaults that preserve current behavior). LCMA adopts the shared `lithos_write` status-based response contract from the source-url dedup + digest v2 plans (`created`/`updated`/`duplicate` with optional `warnings`) rather than introducing a separate return shape.
 
 ## MVP 1 (3 scouts + Terrace 1 — wraps existing engines)
 
-- Move `coordination.db` from `data/` root into `data/.lithos/` (auto-migrated on first startup)
+- Verify existing `coordination.db` migration path remains stable (already implemented)
 - `lithos_retrieve` tool orchestrating scouts internally
 - Scouts: vector (ChromaDB), lexical (Tantivy), tags/recency (KnowledgeManager)
 - Basic rerank with `note_type` priors (requires new optional frontmatter fields)
-- Extend `lithos_write` with optional LCMA frontmatter params (`note_type`, `namespace`, `access_scope`, etc.)
+- Extend `lithos_write` with optional LCMA frontmatter params (`note_type`, `namespace`, `access_scope`, etc.) while reusing the shared cross-plan write payload (`source_url`, `derived_from_ids`, `ttl_hours`/`expires_at`, etc.) and shared status-based response envelope
 - `data/.lithos/receipts.jsonl` logging
 - `data/.lithos/edges.db` (related_to) + basic reinforcement
 - `data/.lithos/stats.db` (node_stats, coactivation)
@@ -1008,9 +1016,30 @@ Each MVP builds on the existing Lithos infrastructure. Existing tools are extend
 - `lithos_node_stats` — view/query salience and usage stats
 - `lithos_receipts` — query retrieval audit history
 
+  ```python
+  lithos_receipts(
+      agent: str | None = None,
+      task_id: str | None = None,
+      since: str | None = None,   # ISO datetime
+      limit: int = 50
+  ) -> {
+      "receipts": [{ "ts", "query", "agent", "task_id", "temperature",
+                      "terrace_reached", "final_nodes", "conflicts_surfaced" }]
+  }
+  ```
+
+  Reads from `receipts.jsonl` with optional filtering. Read-only query tool; does not affect retrieval behavior or stats.
+
+Provenance query policy:
+
+- Canonical lineage queries use `lithos_provenance` (frontmatter/index based).
+- `lithos_edge_list` is for typed LCMA edges and projected relationships; it is not the canonical lineage API.
+
 ### Existing frontmatter fields preserved
 
 All existing `KnowledgeMetadata` fields (`id`, `title`, `author`, `created_at`, `updated_at`, `tags`, `aliases`, `confidence`, `contributors`, `source`, `supersedes`) are kept unchanged. LCMA adds optional fields with defaults.
+
+LCMA is also compatible with cross-plan metadata additions: `source_url`, `derived_from_ids`, and `expires_at`.
 
 ### Existing infrastructure preserved
 
@@ -1025,5 +1054,14 @@ All existing `KnowledgeMetadata` fields (`id`, `title`, `author`, `created_at`, 
 
 - **`confidence` vs `salience`**: `confidence` (frontmatter) = author's belief about accuracy. `salience` (stats.db) = retrieval utility learned from usage. Both are 0–1 floats but serve different purposes.
 - **NetworkX vs edges.db**: NetworkX handles structural `[[wiki-link]]` navigation and powers `lithos_links`. edges.db handles semantic/learned relationships with weights and types. Both are queried by the graph scout.
+- **Declared provenance vs learned edges**: `derived_from_ids` is the source of truth for declared lineage. `edges.db` can carry mirrored `derived_from` edges as an accelerator only.
 - **Frontmatter vs stats.db**: Static metadata in frontmatter (author, tags, note_type). Dynamic signals in stats.db (salience, retrieval_count, decay). This avoids constant file rewrites from learning updates.
 - **Concept nodes**: Regular `KnowledgeDocument` notes with `note_type: “concept”`, not a separate entity type. Created via standard `lithos_write`.
+
+### LLM integration scope
+
+`should_use_llm_pass()` and `llm_interpretive_select()` require an external LLM provider. This is deferred to MVP 2+. MVP 1 stops at Terrace 1 (fast re-rank only) — no local model is bundled and no external LLM call is made.
+
+When `should_use_llm_pass()` returns `True` in MVP 1, the implementation should fall through to `final_nodes = top[:q.max_context_nodes]` as if Terrace 1 was the terminal decision, and log a debug note that Terrace 2 is not yet configured.
+
+The external LLM provider will be configured via a new `LithosConfig` field (provisionally `LithosConfig.lcma.llm_provider`) when MVP 2 ships.
