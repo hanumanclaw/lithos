@@ -25,6 +25,39 @@ Lithos is an MCP server that provides a shared knowledge store for AI agents run
 
 ## Quickstart
 
+### Agent Zero
+
+Agent Zero running inside docker on the same machine running lithos
+
+```json
+{
+  "mcpServers": {
+    "lithos": {
+      "url": "http://host.docker.internal:8765/sse"
+    }
+  }
+}
+```
+
+### OpenClaw
+
+Update `mcporter.sjon` Probably in `~/.openclaw/workspace/config/mcporter.json`
+
+Use `localhost` if running on the same machine as OpenClaw, otherwise the name or IP address of the server.
+
+```json
+{
+  "mcpServers": {
+    "lithos": {
+      "baseUrl": "http://<your hostname>:8765/sse"
+    }
+  },
+  "imports": []
+}
+```
+
+### Claude code
+
 ```bash
 claude mcp add --transport sse lithos http://localhost:8765/sse
 ```
