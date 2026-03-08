@@ -14,6 +14,19 @@ from watchdog.observers import Observer
 
 from lithos.config import LithosConfig, get_config, set_config
 from lithos.coordination import CoordinationService
+from lithos.events import (
+    AGENT_REGISTERED,
+    FINDING_POSTED,
+    NOTE_CREATED,
+    NOTE_DELETED,
+    NOTE_UPDATED,
+    TASK_CLAIMED,
+    TASK_COMPLETED,
+    TASK_CREATED,
+    TASK_RELEASED,
+    EventBus,
+    LithosEvent,
+)
 from lithos.graph import KnowledgeGraph
 from lithos.knowledge import _UNSET, KnowledgeDocument, KnowledgeManager, _UnsetType
 from lithos.search import SearchEngine
@@ -39,6 +52,7 @@ class LithosServer:
         self.search = SearchEngine(self._config)
         self.graph = KnowledgeGraph(self._config)
         self.coordination = CoordinationService(self._config)
+        self.event_bus = EventBus(self._config.events)
 
         # Cached active claims count for the OTEL observable gauge callback
         self._cached_active_claims: int = 0
@@ -62,6 +76,13 @@ class LithosServer:
     def config(self) -> LithosConfig:
         """Get configuration."""
         return self._config
+
+    async def _emit(self, event: LithosEvent) -> None:
+        """Emit an event, logging any failure without propagating."""
+        try:
+            await self.event_bus.emit(event)
+        except Exception:
+            logger.exception("Failed to emit %s event", event.type)
 
     async def initialize(self) -> None:
         """Initialize all components."""
@@ -155,15 +176,29 @@ class LithosServer:
                     if deleted:
                         doc_id = self.knowledge.get_id_by_path(relative_path)
                         if doc_id:
-                            await self.knowledge.delete(doc_id)
+                            await self.knowledge.delete(doc_id)  # path unused; watcher has it
                             self.search.remove_document(doc_id)
                             self.graph.remove_document(doc_id)
                             self.graph.save_cache()
+
+                            await self._emit(
+                                LithosEvent(
+                                    type=NOTE_DELETED,
+                                    payload={"path": str(relative_path)},
+                                )
+                            )
                     else:
                         doc, _ = await self.knowledge.read(path=str(relative_path))
                         self.search.index_document(doc)
                         self.graph.add_document(doc)
                         self.graph.save_cache()
+
+                        await self._emit(
+                            LithosEvent(
+                                type=NOTE_UPDATED,
+                                payload={"path": str(relative_path)},
+                            )
+                        )
                 except Exception as e:
                     logger.error("Error handling file change %s: %s", path, e)
 
@@ -276,6 +311,16 @@ class LithosServer:
                 span.set_attribute("lithos.doc_id", doc.id)
                 span.set_attribute("lithos.write_status", status_label)
                 logger.info("lithos_write completed doc_id=%s status=%s", doc.id, status_label)
+
+                await self._emit(
+                    LithosEvent(
+                        type=NOTE_UPDATED if id else NOTE_CREATED,
+                        agent=agent,
+                        payload={"id": doc.id, "title": doc.title, "path": str(doc.path)},
+                        tags=doc.metadata.tags,
+                    )
+                )
+
                 return {
                     "status": status_label,
                     "id": doc.id,
@@ -349,12 +394,20 @@ class LithosServer:
                     span.set_attribute("lithos.agent", agent)
                     await self.coordination.ensure_agent_known(agent)
 
-                success = await self.knowledge.delete(id)
+                success, path = await self.knowledge.delete(id)
 
                 if success:
                     self.search.remove_document(id)
                     self.graph.remove_document(id)
                     self.graph.save_cache()
+
+                    await self._emit(
+                        LithosEvent(
+                            type=NOTE_DELETED,
+                            agent=agent or "",
+                            payload={"id": id, "path": path},
+                        )
+                    )
 
                 return {"success": success}
 
@@ -614,6 +667,16 @@ class LithosServer:
                     metadata=metadata,
                 )
                 span.set_attribute("lithos.created", created)
+
+                if success:
+                    await self._emit(
+                        LithosEvent(
+                            type=AGENT_REGISTERED,
+                            agent=id,
+                            payload={"agent_id": id, "name": name or ""},
+                        )
+                    )
+
                 return {"success": success, "created": created}
 
         @self.mcp.tool()
@@ -725,6 +788,15 @@ class LithosServer:
                     tags=tags,
                 )
                 span.set_attribute("lithos.task_id", task_id)
+
+                await self._emit(
+                    LithosEvent(
+                        type=TASK_CREATED,
+                        agent=agent,
+                        payload={"task_id": task_id, "title": title},
+                    )
+                )
+
                 return {"task_id": task_id}
 
         @self.mcp.tool()
@@ -759,6 +831,16 @@ class LithosServer:
                     ttl_minutes=ttl_minutes,
                 )
                 span.set_attribute("lithos.success", success)
+
+                if success:
+                    await self._emit(
+                        LithosEvent(
+                            type=TASK_CLAIMED,
+                            agent=agent,
+                            payload={"task_id": task_id, "agent": agent, "aspect": aspect},
+                        )
+                    )
+
                 return {
                     "success": success,
                     "expires_at": expires_at.isoformat() if expires_at else None,
@@ -830,6 +912,16 @@ class LithosServer:
                     agent=agent,
                 )
                 span.set_attribute("lithos.success", success)
+
+                if success:
+                    await self._emit(
+                        LithosEvent(
+                            type=TASK_RELEASED,
+                            agent=agent,
+                            payload={"task_id": task_id, "agent": agent, "aspect": aspect},
+                        )
+                    )
+
                 return {"success": success}
 
         @self.mcp.tool()
@@ -857,6 +949,16 @@ class LithosServer:
                     agent=agent,
                 )
                 span.set_attribute("lithos.success", success)
+
+                if success:
+                    await self._emit(
+                        LithosEvent(
+                            type=TASK_COMPLETED,
+                            agent=agent,
+                            payload={"task_id": task_id, "agent": agent},
+                        )
+                    )
+
                 return {"success": success}
 
         @self.mcp.tool()
@@ -930,6 +1032,19 @@ class LithosServer:
                     knowledge_id=knowledge_id,
                 )
                 span.set_attribute("lithos.finding_id", finding_id)
+
+                await self._emit(
+                    LithosEvent(
+                        type=FINDING_POSTED,
+                        agent=agent,
+                        payload={
+                            "finding_id": finding_id,
+                            "task_id": task_id,
+                            "agent": agent,
+                        },
+                    )
+                )
+
                 return {"finding_id": finding_id}
 
         @self.mcp.tool()
