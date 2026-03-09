@@ -7,6 +7,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Literal
 from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
 import frontmatter
@@ -47,6 +48,7 @@ _KNOWN_METADATA_KEYS = frozenset(
         "source",
         "source_url",
         "supersedes",
+        "derived_from_ids",
     }
 )
 
@@ -107,6 +109,72 @@ def normalize_url(raw: str) -> str:
     return urlunparse((scheme, netloc, path, "", query, ""))
 
 
+def validate_derived_from_ids(ids: list[str], self_id: str | None = None) -> list[str]:
+    """Validate and normalize a list of derived-from document IDs.
+
+    Returns a deduplicated, sorted list of lowercased UUID strings.
+    Raises ValueError for invalid entries or self-references.
+    """
+    normalized: list[str] = []
+    for raw in ids:
+        if not isinstance(raw, str):
+            raise ValueError(f"derived_from_ids entry must be a string, got {type(raw).__name__}")
+        trimmed = raw.strip()
+        if not trimmed:
+            raise ValueError("derived_from_ids entry must not be empty or whitespace-only")
+        try:
+            parsed = uuid.UUID(trimmed)
+        except ValueError as err:
+            raise ValueError(f"Invalid UUID in derived_from_ids: {trimmed!r}") from err
+        normalized.append(str(parsed))
+
+    result = sorted(set(normalized))
+
+    if self_id is not None:
+        self_normalized = str(uuid.UUID(self_id))
+        if self_normalized in result:
+            raise ValueError(f"derived_from_ids must not contain self-reference: {self_normalized}")
+
+    return result
+
+
+def normalize_derived_from_ids_lenient(ids: list[str], self_id: str | None = None) -> list[str]:
+    """Normalize derived_from_ids leniently for disk ingestion.
+
+    Like validate_derived_from_ids() but logs warnings and skips
+    invalid entries instead of raising ValueError.
+    Returns a deduplicated, sorted list of lowercased UUID strings.
+    """
+    normalized: list[str] = []
+    for raw in ids:
+        if not isinstance(raw, str):
+            logger.warning("Skipping non-string derived_from_ids entry: %r", raw)
+            continue
+        trimmed = raw.strip()
+        if not trimmed:
+            logger.warning("Skipping empty derived_from_ids entry")
+            continue
+        try:
+            parsed = uuid.UUID(trimmed)
+        except ValueError:
+            logger.warning("Skipping invalid UUID in derived_from_ids: %r", trimmed)
+            continue
+        normalized.append(str(parsed))
+
+    result = sorted(set(normalized))
+
+    if self_id is not None:
+        try:
+            self_normalized = str(uuid.UUID(self_id))
+            if self_normalized in result:
+                logger.warning("Removing self-reference from derived_from_ids: %s", self_normalized)
+                result.remove(self_normalized)
+        except ValueError:
+            pass
+
+    return result
+
+
 @dataclass
 class KnowledgeMetadata:
     """Document metadata stored in YAML frontmatter."""
@@ -123,6 +191,7 @@ class KnowledgeMetadata:
     source: str | None = None
     source_url: str | None = None
     supersedes: str | None = None
+    derived_from_ids: list[str] = field(default_factory=list)
     extra: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
@@ -147,6 +216,8 @@ class KnowledgeMetadata:
         }
         if self.source_url is not None:
             result["source_url"] = self.source_url
+        if self.derived_from_ids:
+            result["derived_from_ids"] = self.derived_from_ids
         # Merge unknown fields — known keys always take precedence.
         for key, value in self.extra.items():
             if key not in result:
@@ -187,6 +258,7 @@ class KnowledgeMetadata:
             source=data.get("source"),
             source_url=data.get("source_url"),
             supersedes=data.get("supersedes"),
+            derived_from_ids=data.get("derived_from_ids", []),
             extra=extra,
         )
 
@@ -216,6 +288,27 @@ class KnowledgeDocument:
         """Convert to markdown string with frontmatter."""
         post = frontmatter.Post(self.full_content, **self.metadata.to_dict())
         return frontmatter.dumps(post)
+
+
+@dataclass
+class DuplicateInfo:
+    """Information about a duplicate document."""
+
+    id: str
+    title: str
+    source_url: str | None = None
+
+
+@dataclass
+class WriteResult:
+    """Structured result type for create/update operations."""
+
+    status: Literal["created", "updated", "duplicate", "error"]
+    document: KnowledgeDocument | None = None
+    warnings: list[str] = field(default_factory=list)
+    error_code: str | None = None
+    message: str | None = None
+    duplicate_of: DuplicateInfo | None = None
 
 
 def slugify(text: str) -> str:
@@ -307,6 +400,17 @@ def truncate_content(content: str, max_length: int) -> tuple[str, bool]:
     return content[:effective_max] + "...", True
 
 
+@dataclass
+class _CachedMeta:
+    """Lightweight metadata cache for filtering without disk I/O."""
+
+    title: str
+    author: str
+    tags: list[str]
+    updated_at: datetime
+    path: Path
+
+
 class _UnsetType:
     """Sentinel type for omit-vs-clear distinction on optional fields."""
 
@@ -330,14 +434,38 @@ class KnowledgeManager:
         self.config = get_config()
         self.knowledge_path = self.config.storage.knowledge_path
         self._id_to_path: dict[str, Path] = {}
+        self._path_to_id: dict[Path, str] = {}
         self._slug_to_id: dict[str, str] = {}
         self._source_url_to_id: dict[str, str] = {}
         self._write_lock = asyncio.Lock()
         self.duplicate_url_count: int = 0
+        # Provenance indexes
+        self._doc_to_sources: dict[str, list[str]] = {}
+        self._source_to_derived: dict[str, set[str]] = {}
+        self._unresolved_provenance: dict[str, set[str]] = {}
+        self._id_to_title: dict[str, str] = {}
+        self._meta_cache: dict[str, _CachedMeta] = {}
         self._scan_existing()
 
     def _scan_existing(self) -> None:
-        """Scan existing documents and build indices."""
+        """Scan existing documents and build indices.
+
+        Uses a two-pass approach:
+        - Pass 1: Walk files, populate core indexes and collect provenance pairs.
+        - Pass 2: Classify provenance references as resolved or unresolved.
+        """
+        # Clear all indexes before rebuilding (prevents stale accumulation).
+        self._id_to_path.clear()
+        self._path_to_id.clear()
+        self._slug_to_id.clear()
+        self._source_url_to_id.clear()
+        self._doc_to_sources.clear()
+        self._source_to_derived.clear()
+        self._unresolved_provenance.clear()
+        self._id_to_title.clear()
+        self._meta_cache.clear()
+        self.duplicate_url_count = 0
+
         if not self.knowledge_path.exists():
             return
 
@@ -352,6 +480,9 @@ class KnowledgeManager:
         candidates.sort(key=lambda t: t[0])
         collisions: list[tuple[str, str, str]] = []  # (norm_url, first_id, dup_id)
 
+        # Pass 1: Walk files, populate core indexes, collect provenance.
+        deferred_provenance: list[tuple[str, list[str]]] = []
+
         for rel_path, md_file in candidates:
             try:
                 post = frontmatter.load(str(md_file))
@@ -359,8 +490,28 @@ class KnowledgeManager:
                 title: str = post.metadata.get("title", "")  # type: ignore[assignment]
                 if doc_id:
                     self._id_to_path[doc_id] = rel_path
+                    self._path_to_id[rel_path] = doc_id
                     if title:
                         self._slug_to_id[slugify(title)] = doc_id
+                        self._id_to_title[doc_id] = title
+
+                    # Populate metadata cache for filtering
+                    raw_updated = post.metadata.get("updated_at")
+                    if isinstance(raw_updated, str):
+                        updated_at = datetime.fromisoformat(raw_updated)
+                    elif isinstance(raw_updated, datetime):
+                        updated_at = raw_updated
+                    else:
+                        updated_at = datetime.now(timezone.utc)
+                    raw_tags: list[str] = post.metadata.get("tags", [])  # type: ignore[assignment]
+                    raw_author: str = post.metadata.get("author", "")  # type: ignore[assignment]
+                    self._meta_cache[doc_id] = _CachedMeta(
+                        title=title,
+                        author=raw_author if isinstance(raw_author, str) else "",
+                        tags=raw_tags if isinstance(raw_tags, list) else [],
+                        updated_at=updated_at,
+                        path=rel_path,
+                    )
 
                     # Populate source_url -> id map
                     raw_url: str | None = post.metadata.get("source_url")  # type: ignore[assignment]
@@ -374,8 +525,40 @@ class KnowledgeManager:
                                 collisions.append((norm, existing_id, doc_id))
                         except ValueError:
                             pass  # Skip invalid URLs on load
-            except Exception:
-                pass  # Skip invalid files
+
+                    # Collect derived_from_ids for pass 2
+                    derived_from: list[str] = post.metadata.get("derived_from_ids", [])  # type: ignore[assignment]
+                    if isinstance(derived_from, list):
+                        deferred_provenance.append((doc_id, derived_from))
+                    else:
+                        deferred_provenance.append((doc_id, []))
+            except Exception as e:
+                logger.warning("Skipping invalid file %s: %s", md_file, e)
+
+        # Pass 2: Normalize and classify provenance references as resolved or unresolved.
+        for doc_id, source_ids in deferred_provenance:
+            normalized_ids = normalize_derived_from_ids_lenient(source_ids, self_id=doc_id)
+            self._doc_to_sources[doc_id] = normalized_ids
+            for source_id in normalized_ids:
+                if source_id in self._id_to_path:
+                    # Resolved: source document exists
+                    if source_id not in self._source_to_derived:
+                        self._source_to_derived[source_id] = set()
+                    self._source_to_derived[source_id].add(doc_id)
+                else:
+                    # Unresolved: source document not found
+                    if source_id not in self._unresolved_provenance:
+                        self._unresolved_provenance[source_id] = set()
+                    self._unresolved_provenance[source_id].add(doc_id)
+
+        resolved_count = sum(len(v) for v in self._source_to_derived.values())
+        unresolved_count = sum(len(v) for v in self._unresolved_provenance.values())
+        if resolved_count or unresolved_count:
+            logger.info(
+                "Provenance scan: %d resolved references, %d unresolved references",
+                resolved_count,
+                unresolved_count,
+            )
 
         # Report collisions deterministically (sorted by normalized URL).
         if collisions:
@@ -412,11 +595,11 @@ class KnowledgeManager:
         path: str | None = None,
         source: str | None = None,
         source_url: str | None = None,
-    ) -> KnowledgeDocument | dict:
+        derived_from_ids: list[str] | None = None,
+    ) -> WriteResult:
         """Create a new knowledge document.
 
-        Returns KnowledgeDocument on success, or a dict with status info on
-        duplicate/invalid_input.
+        Returns WriteResult with status 'created', 'duplicate', or 'error'.
         """
         async with self._write_lock:
             lithos_metrics.knowledge_ops.add(1, {"op": "create"})
@@ -427,25 +610,41 @@ class KnowledgeManager:
                 try:
                     norm_url = normalize_url(source_url)
                 except ValueError as e:
-                    return {"status": "invalid_input", "message": str(e)}
+                    return WriteResult(
+                        status="error",
+                        error_code="invalid_input",
+                        message=str(e),
+                    )
 
                 # Check dedup map
                 existing_id = self._source_url_to_id.get(norm_url)
                 if existing_id is not None:
                     try:
                         existing_doc, _ = await self.read(id=existing_id)
-                        return {
-                            "status": "duplicate",
-                            "duplicate_of": {
-                                "id": existing_id,
-                                "title": existing_doc.title,
-                                "source_url": norm_url,
-                            },
-                            "message": (f"URL already exists in document '{existing_doc.title}'"),
-                        }
+                        return WriteResult(
+                            status="duplicate",
+                            duplicate_of=DuplicateInfo(
+                                id=existing_id,
+                                title=existing_doc.title,
+                                source_url=norm_url,
+                            ),
+                            message=f"URL already exists in document '{existing_doc.title}'",
+                        )
                     except FileNotFoundError:
                         # Stale map entry; allow create
                         del self._source_url_to_id[norm_url]
+
+            # Validate and normalize derived_from_ids
+            normalized_provenance: list[str] = []
+            if derived_from_ids:
+                try:
+                    normalized_provenance = validate_derived_from_ids(derived_from_ids)
+                except ValueError as e:
+                    return WriteResult(
+                        status="error",
+                        error_code="invalid_input",
+                        message=str(e),
+                    )
 
             doc_id = str(uuid.uuid4())
             now = datetime.now(timezone.utc)
@@ -461,6 +660,7 @@ class KnowledgeManager:
                 contributors=[],
                 source=source,
                 source_url=norm_url,
+                derived_from_ids=normalized_provenance,
             )
 
             # Determine file path
@@ -486,11 +686,44 @@ class KnowledgeManager:
 
             # Update indices
             self._id_to_path[doc_id] = file_path
+            self._path_to_id[file_path] = doc_id
             self._slug_to_id[slug] = doc_id
             if norm_url is not None:
                 self._source_url_to_id[norm_url] = doc_id
 
-            return doc
+            # Update provenance indexes
+            warnings: list[str] = []
+            self._doc_to_sources[doc_id] = normalized_provenance
+            self._id_to_title[doc_id] = title
+            for source_id in normalized_provenance:
+                if source_id in self._id_to_path:
+                    # Resolved: source document exists
+                    if source_id not in self._source_to_derived:
+                        self._source_to_derived[source_id] = set()
+                    self._source_to_derived[source_id].add(doc_id)
+                else:
+                    # Unresolved: source document not found
+                    if source_id not in self._unresolved_provenance:
+                        self._unresolved_provenance[source_id] = set()
+                    self._unresolved_provenance[source_id].add(doc_id)
+                    warnings.append(f"derived_from_ids contains missing document: {source_id}")
+
+            # Auto-resolve: check if any existing docs had unresolved refs to this new doc
+            if doc_id in self._unresolved_provenance:
+                resolved_docs = self._unresolved_provenance.pop(doc_id)
+                if doc_id not in self._source_to_derived:
+                    self._source_to_derived[doc_id] = set()
+                self._source_to_derived[doc_id].update(resolved_docs)
+
+            self._meta_cache[doc_id] = _CachedMeta(
+                title=title,
+                author=metadata.author,
+                tags=list(metadata.tags),
+                updated_at=metadata.updated_at,
+                path=file_path,
+            )
+
+            return WriteResult(status="created", document=doc, warnings=warnings)
 
     @traced("lithos.knowledge.read")
     async def read(
@@ -536,6 +769,15 @@ class KnowledgeManager:
         if max_length:
             content, truncated = truncate_content(content, max_length)
 
+        # Overlay canonical provenance from in-memory index so all callers
+        # see the same normalized value (not just the raw frontmatter).
+        # Only overlay when the index has a non-empty list; an empty index
+        # entry means the doc was created without provenance, so the on-disk
+        # frontmatter (which may have been edited externally) takes precedence.
+        indexed_sources = self._doc_to_sources.get(metadata.id)
+        if indexed_sources:
+            metadata.derived_from_ids = indexed_sources
+
         doc = KnowledgeDocument(
             id=metadata.id,
             title=title,
@@ -547,6 +789,25 @@ class KnowledgeManager:
 
         return doc, truncated
 
+    def _remove_provenance_entries(self, doc_id: str) -> None:
+        """Remove a document's provenance entries from reverse indexes.
+
+        Cleans up _source_to_derived and _unresolved_provenance for the given doc_id
+        based on its current _doc_to_sources entries.
+        """
+        old_sources = self._doc_to_sources.get(doc_id, [])
+        for source_id in old_sources:
+            # Remove from resolved index
+            if source_id in self._source_to_derived:
+                self._source_to_derived[source_id].discard(doc_id)
+                if not self._source_to_derived[source_id]:
+                    del self._source_to_derived[source_id]
+            # Remove from unresolved index
+            if source_id in self._unresolved_provenance:
+                self._unresolved_provenance[source_id].discard(doc_id)
+                if not self._unresolved_provenance[source_id]:
+                    del self._unresolved_provenance[source_id]
+
     @traced("lithos.knowledge.update")
     async def update(
         self,
@@ -557,13 +818,19 @@ class KnowledgeManager:
         tags: list[str] | None = None,
         confidence: float | None = None,
         source_url: str | None | _UnsetType = _UNSET,
-    ) -> KnowledgeDocument | dict:
+        derived_from_ids: list[str] | None | _UnsetType = _UNSET,
+    ) -> WriteResult:
         """Update an existing document.
 
         source_url semantics:
         - _UNSET (default): preserve existing source_url, no map change
         - None: clear existing source_url, remove from map
         - str: normalize, allow if same doc owns it, reject if different doc owns it
+
+        derived_from_ids semantics:
+        - _UNSET (default): preserve existing derived_from_ids, no index change
+        - None or []: clear existing provenance, remove from all provenance indexes
+        - non-empty list: validate, normalize, replace entire set
         """
         async with self._write_lock:
             lithos_metrics.knowledge_ops.add(1, {"op": "update"})
@@ -588,23 +855,25 @@ class KnowledgeManager:
                     try:
                         new_norm = normalize_url(source_url)
                     except ValueError as e:
-                        return {"status": "invalid_input", "message": str(e)}
+                        return WriteResult(
+                            status="error",
+                            error_code="invalid_input",
+                            message=str(e),
+                        )
 
                     existing_owner = self._source_url_to_id.get(new_norm)
                     if existing_owner is not None and existing_owner != id:
                         try:
                             existing_doc, _ = await self.read(id=existing_owner)
-                            return {
-                                "status": "duplicate",
-                                "duplicate_of": {
-                                    "id": existing_owner,
-                                    "title": existing_doc.title,
-                                    "source_url": new_norm,
-                                },
-                                "message": (
-                                    f"URL already exists in document '{existing_doc.title}'"
+                            return WriteResult(
+                                status="duplicate",
+                                duplicate_of=DuplicateInfo(
+                                    id=existing_owner,
+                                    title=existing_doc.title,
+                                    source_url=new_norm,
                                 ),
-                            }
+                                message=f"URL already exists in document '{existing_doc.title}'",
+                            )
                         except FileNotFoundError:
                             del self._source_url_to_id[new_norm]
 
@@ -619,6 +888,44 @@ class KnowledgeManager:
 
                     doc.metadata.source_url = new_norm
                     self._source_url_to_id[new_norm] = id
+
+            # Handle derived_from_ids update
+            warnings: list[str] = []
+            if not isinstance(derived_from_ids, _UnsetType):
+                if derived_from_ids is None or derived_from_ids == []:
+                    # Clear provenance
+                    self._remove_provenance_entries(id)
+                    doc.metadata.derived_from_ids = []
+                    self._doc_to_sources[id] = []
+                else:
+                    # Replace with new list — validate first
+                    try:
+                        normalized = validate_derived_from_ids(derived_from_ids, self_id=id)
+                    except ValueError as e:
+                        return WriteResult(
+                            status="error",
+                            error_code="invalid_input",
+                            message=str(e),
+                        )
+
+                    # Remove old provenance entries
+                    self._remove_provenance_entries(id)
+
+                    # Add new entries
+                    doc.metadata.derived_from_ids = normalized
+                    self._doc_to_sources[id] = normalized
+                    for source_id in normalized:
+                        if source_id in self._id_to_path:
+                            if source_id not in self._source_to_derived:
+                                self._source_to_derived[source_id] = set()
+                            self._source_to_derived[source_id].add(id)
+                        else:
+                            if source_id not in self._unresolved_provenance:
+                                self._unresolved_provenance[source_id] = set()
+                            self._unresolved_provenance[source_id].add(id)
+                            warnings.append(
+                                f"derived_from_ids contains missing document: {source_id}"
+                            )
 
             # Update fields
             if content is not None:
@@ -648,7 +955,20 @@ class KnowledgeManager:
                     del self._slug_to_id[old_slug]
                 self._slug_to_id[new_slug] = id
 
-            return doc
+            # Update _id_to_title if title changed
+            if title is not None:
+                self._id_to_title[id] = title
+
+            # Update metadata cache
+            self._meta_cache[id] = _CachedMeta(
+                title=doc.metadata.title,
+                author=doc.metadata.author,
+                tags=list(doc.metadata.tags),
+                updated_at=doc.metadata.updated_at,
+                path=doc.path,
+            )
+
+            return WriteResult(status="updated", document=doc, warnings=warnings)
 
     @traced("lithos.knowledge.delete")
     async def delete(self, id: str) -> tuple[bool, str]:
@@ -682,9 +1002,23 @@ class KnowledgeManager:
                 full_path.unlink()
 
             # Update indices
-            del self._id_to_path[id]
+            old_path = self._id_to_path.pop(id)
+            self._path_to_id.pop(old_path, None)
             # Remove from slug index
             self._slug_to_id = {k: v for k, v in self._slug_to_id.items() if v != id}
+
+            # Provenance cleanup
+            # 1. Remove this doc as a "derived" doc from reverse indexes
+            self._remove_provenance_entries(id)
+            # 2. Remove forward index entry
+            self._doc_to_sources.pop(id, None)
+            # 3. If this doc was a source for others, move those to unresolved
+            derived_docs = self._source_to_derived.pop(id, set())
+            if derived_docs:
+                self._unresolved_provenance[id] = derived_docs
+            # 4. Remove from title and metadata caches
+            self._id_to_title.pop(id, None)
+            self._meta_cache.pop(id, None)
 
             return True, str(file_path)
 
@@ -697,47 +1031,44 @@ class KnowledgeManager:
         tags: list[str] | None = None,
         author: str | None = None,
     ) -> tuple[list[KnowledgeDocument], int]:
-        """List all documents with optional filtering."""
-        docs = []
-        total = 0
+        """List all documents with optional filtering.
+
+        Uses the in-memory metadata cache for filtering so only matching
+        documents require a full disk read.
+        """
+        matching_ids: list[str] = []
         normalized_since = _normalize_datetime(since) if since else None
 
-        for doc_id in self._id_to_path:
+        for doc_id, cached in self._meta_cache.items():
+            if path_prefix and not str(cached.path).startswith(path_prefix):
+                continue
+            if tags and not any(t in cached.tags for t in tags):
+                continue
+            if author and cached.author != author:
+                continue
+            if normalized_since:
+                doc_updated = _normalize_datetime(cached.updated_at)
+                if doc_updated < normalized_since:
+                    continue
+            matching_ids.append(doc_id)
+
+        total = len(matching_ids)
+        docs = []
+        for doc_id in matching_ids[offset : offset + limit]:
             try:
                 doc, _ = await self.read(id=doc_id)
-
-                # Apply filters
-                if path_prefix and not str(doc.path).startswith(path_prefix):
-                    continue
-                if tags and not any(t in doc.metadata.tags for t in tags):
-                    continue
-                if author and doc.metadata.author != author:
-                    continue
-                if normalized_since:
-                    doc_updated = _normalize_datetime(doc.metadata.updated_at)
-                    if doc_updated < normalized_since:
-                        continue
-
-                total += 1
-                if total > offset and len(docs) < limit:
-                    docs.append(doc)
+                docs.append(doc)
             except Exception:
                 pass
 
         return docs, total
 
     async def get_all_tags(self) -> dict[str, int]:
-        """Get all tags with document counts."""
+        """Get all tags with document counts (from in-memory cache)."""
         tag_counts: dict[str, int] = {}
-
-        for doc_id in self._id_to_path:
-            try:
-                doc, _ = await self.read(id=doc_id)
-                for tag in doc.metadata.tags:
-                    tag_counts[tag] = tag_counts.get(tag, 0) + 1
-            except Exception:
-                pass
-
+        for cached in self._meta_cache.values():
+            for tag in cached.tags:
+                tag_counts[tag] = tag_counts.get(tag, 0) + 1
         return tag_counts
 
     async def find_by_source_url(self, url: str) -> KnowledgeDocument | None:
@@ -761,12 +1092,160 @@ class KnowledgeManager:
         except FileNotFoundError:
             return None
 
+    async def sync_from_disk(self, path: Path) -> KnowledgeDocument:
+        """Re-read a file from disk and update all manager indexes.
+
+        Handles both new files and modified files uniformly.
+        Returns the parsed document for downstream search/graph indexing.
+
+        Args:
+            path: Relative path under knowledge_path (e.g. Path("my-note.md"))
+
+        Raises:
+            FileNotFoundError: If the file does not exist on disk.
+            ValueError: If the file cannot be parsed.
+        """
+        async with self._write_lock:
+            return self._sync_from_disk_unlocked(path)
+
+    def _sync_from_disk_unlocked(self, path: Path) -> KnowledgeDocument:
+        """Internal sync logic, called with _write_lock held."""
+        file_path, full_path = self._resolve_safe_path(path)
+        if not full_path.exists():
+            raise FileNotFoundError(f"File not found: {file_path}")
+
+        post = frontmatter.load(str(full_path))
+        metadata = KnowledgeMetadata.from_dict(post.metadata)
+
+        # Extract title and content from body
+        title, content = extract_title_from_content(post.content)
+        if not title:
+            title = metadata.title
+
+        links = parse_wiki_links(content)
+
+        doc = KnowledgeDocument(
+            id=metadata.id,
+            title=title,
+            content=content,
+            metadata=metadata,
+            path=file_path,
+            links=links,
+        )
+
+        doc_id = doc.id
+        is_new = doc_id not in self._id_to_path
+
+        # Update core indexes
+        if not is_new:
+            old_path = self._id_to_path.get(doc_id)
+            if old_path is not None:
+                self._path_to_id.pop(old_path, None)
+        self._id_to_path[doc_id] = file_path
+        self._path_to_id[file_path] = doc_id
+        old_slug = None
+        if not is_new:
+            # Find the old slug for this doc to clean it up
+            for s, sid in self._slug_to_id.items():
+                if sid == doc_id:
+                    old_slug = s
+                    break
+        new_slug = slugify(title)
+        if old_slug and old_slug != new_slug and self._slug_to_id.get(old_slug) == doc_id:
+            del self._slug_to_id[old_slug]
+        self._slug_to_id[new_slug] = doc_id
+
+        # Update source_url index
+        raw_url = metadata.source_url
+        if raw_url:
+            try:
+                norm = normalize_url(raw_url)
+                # Remove any old mapping for this doc
+                old_urls_to_remove = [k for k, v in self._source_url_to_id.items() if v == doc_id]
+                for k in old_urls_to_remove:
+                    del self._source_url_to_id[k]
+                # Check if another doc already owns this URL (first-owner-wins)
+                existing_owner = self._source_url_to_id.get(norm)
+                if existing_owner is not None and existing_owner != doc_id:
+                    logger.warning(
+                        "source_url collision in sync_from_disk: %s owned by %s, "
+                        "skipping assignment for %s",
+                        norm,
+                        existing_owner,
+                        doc_id,
+                    )
+                else:
+                    self._source_url_to_id[norm] = doc_id
+            except ValueError:
+                pass
+        else:
+            # Clear any old source_url mapping for this doc
+            old_urls_to_remove = [k for k, v in self._source_url_to_id.items() if v == doc_id]
+            for k in old_urls_to_remove:
+                del self._source_url_to_id[k]
+
+        # Update _id_to_title
+        self._id_to_title[doc_id] = title
+
+        # Update provenance indexes
+        new_sources = normalize_derived_from_ids_lenient(
+            metadata.derived_from_ids or [], self_id=doc_id
+        )
+
+        if not is_new:
+            # Modified file: diff against current state
+            old_sources = self._doc_to_sources.get(doc_id, [])
+            if old_sources != new_sources:
+                # Remove old reverse index entries
+                self._remove_provenance_entries(doc_id)
+                # Add new entries
+                self._doc_to_sources[doc_id] = list(new_sources)
+                for source_id in new_sources:
+                    if source_id in self._id_to_path:
+                        if source_id not in self._source_to_derived:
+                            self._source_to_derived[source_id] = set()
+                        self._source_to_derived[source_id].add(doc_id)
+                    else:
+                        if source_id not in self._unresolved_provenance:
+                            self._unresolved_provenance[source_id] = set()
+                        self._unresolved_provenance[source_id].add(doc_id)
+        else:
+            # New file: add provenance entries
+            self._doc_to_sources[doc_id] = list(new_sources)
+            for source_id in new_sources:
+                if source_id in self._id_to_path:
+                    if source_id not in self._source_to_derived:
+                        self._source_to_derived[source_id] = set()
+                    self._source_to_derived[source_id].add(doc_id)
+                else:
+                    if source_id not in self._unresolved_provenance:
+                        self._unresolved_provenance[source_id] = set()
+                    self._unresolved_provenance[source_id].add(doc_id)
+
+            # Auto-resolve: check if any existing docs had unresolved refs to this new doc
+            if doc_id in self._unresolved_provenance:
+                resolved_docs = self._unresolved_provenance.pop(doc_id)
+                if doc_id not in self._source_to_derived:
+                    self._source_to_derived[doc_id] = set()
+                self._source_to_derived[doc_id].update(resolved_docs)
+
+        # Update metadata cache
+        self._meta_cache[doc_id] = _CachedMeta(
+            title=title,
+            author=metadata.author,
+            tags=list(metadata.tags),
+            updated_at=metadata.updated_at,
+            path=file_path,
+        )
+
+        return doc
+
     def get_id_by_slug(self, slug: str) -> str | None:
         """Get document ID by slug."""
         return self._slug_to_id.get(slug)
 
     def get_id_by_path(self, path: str | Path) -> str | None:
-        """Get document ID by relative/absolute path."""
+        """Get document ID by relative/absolute path (O(1) via reverse map)."""
         candidate = Path(path)
 
         if candidate.is_absolute():
@@ -778,14 +1257,42 @@ class KnowledgeManager:
         if not candidate.suffix:
             candidate = candidate.with_suffix(".md")
 
-        for doc_id, doc_path in self._id_to_path.items():
-            if doc_path == candidate:
-                return doc_id
-        return None
+        return self._path_to_id.get(candidate)
 
     def get_all_slugs(self) -> dict[str, str]:
         """Get mapping of all slugs to IDs."""
         return dict(self._slug_to_id)
+
+    # ==================== Public Provenance Accessors ====================
+
+    def get_doc_sources(self, doc_id: str) -> list[str]:
+        """Get the source IDs this document derives from."""
+        return self._doc_to_sources.get(doc_id, [])
+
+    def get_derived_docs(self, doc_id: str) -> set[str]:
+        """Get IDs of documents derived from this document."""
+        return self._source_to_derived.get(doc_id, set())
+
+    def get_unresolved_sources(self, doc_id: str) -> list[str]:
+        """Get unresolved source IDs for a document."""
+        sources = self._doc_to_sources.get(doc_id, [])
+        return [
+            sid
+            for sid in sources
+            if sid in self._unresolved_provenance or sid not in self._id_to_path
+        ]
+
+    def get_title_by_id(self, doc_id: str) -> str:
+        """Get document title by ID, returning empty string if unknown."""
+        return self._id_to_title.get(doc_id, "")
+
+    def has_document(self, doc_id: str) -> bool:
+        """Check whether a document ID exists."""
+        return doc_id in self._id_to_path
+
+    def rescan(self) -> None:
+        """Public wrapper around _scan_existing() for index rebuilds."""
+        self._scan_existing()
 
 
 def _normalize_datetime(dt: datetime) -> datetime:

@@ -1,6 +1,7 @@
 """Lithos MCP Server - FastMCP server exposing all tools."""
 
 import asyncio
+import collections
 import concurrent.futures
 import hashlib
 import logging
@@ -28,7 +29,7 @@ from lithos.events import (
     LithosEvent,
 )
 from lithos.graph import KnowledgeGraph
-from lithos.knowledge import _UNSET, KnowledgeDocument, KnowledgeManager, _UnsetType
+from lithos.knowledge import _UNSET, KnowledgeManager, _UnsetType
 from lithos.search import SearchEngine
 from lithos.telemetry import get_tracer, register_active_claims_observer
 
@@ -111,6 +112,7 @@ class LithosServer:
         with tracer.start_as_current_span("lithos.index.rebuild") as span:
             self.search.clear_all()
             self.graph.clear()
+            self.knowledge.rescan()
 
             knowledge_path = self.config.storage.knowledge_path
             file_count = 0
@@ -129,6 +131,66 @@ class LithosServer:
             span.set_attribute("lithos.file_count", file_count)
             span.set_attribute("lithos.error_count", error_count)
             self.graph.save_cache()
+
+    def _bfs_provenance(self, start_id: str, direction: str, depth: int) -> list[dict[str, str]]:
+        """BFS traversal over provenance indexes.
+
+        Args:
+            start_id: Starting document ID (excluded from results).
+            direction: "sources" or "derived".
+            depth: Maximum traversal depth (already clamped to 1-3).
+
+        Returns:
+            Sorted list of {id, title} dicts for discovered nodes.
+        """
+        visited: set[str] = {start_id}
+        frontier: collections.deque[str] = collections.deque()
+
+        # Seed the frontier with immediate neighbours
+        if direction == "sources":
+            for nid in self.knowledge.get_doc_sources(start_id):
+                if self.knowledge.has_document(nid) and nid not in visited:
+                    frontier.append(nid)
+                    visited.add(nid)
+        else:  # "derived"
+            for nid in self.knowledge.get_derived_docs(start_id):
+                if nid not in visited:
+                    frontier.append(nid)
+                    visited.add(nid)
+
+        current_depth = 1
+        result_ids: list[str] = list(frontier)
+
+        while current_depth < depth and frontier:
+            next_frontier: list[str] = []
+            for node_id in frontier:
+                if direction == "sources":
+                    neighbours = self.knowledge.get_doc_sources(node_id)
+                    for nid in neighbours:
+                        if self.knowledge.has_document(nid) and nid not in visited:
+                            next_frontier.append(nid)
+                            visited.add(nid)
+                else:
+                    neighbours = self.knowledge.get_derived_docs(node_id)
+                    for nid in neighbours:
+                        if nid not in visited:
+                            next_frontier.append(nid)
+                            visited.add(nid)
+            frontier = collections.deque(next_frontier)
+            result_ids.extend(next_frontier)
+            current_depth += 1
+
+        # Sort by ID for deterministic output, resolve titles
+        return sorted(
+            [
+                {
+                    "id": nid,
+                    "title": self.knowledge.get_title_by_id(nid),
+                }
+                for nid in result_ids
+            ],
+            key=lambda n: n["id"],
+        )
 
     def start_file_watcher(self) -> None:
         """Start watching for file changes."""
@@ -176,7 +238,7 @@ class LithosServer:
                     if deleted:
                         doc_id = self.knowledge.get_id_by_path(relative_path)
                         if doc_id:
-                            await self.knowledge.delete(doc_id)  # path unused; watcher has it
+                            await self.knowledge.delete(doc_id)
                             self.search.remove_document(doc_id)
                             self.graph.remove_document(doc_id)
                             self.graph.save_cache()
@@ -188,7 +250,7 @@ class LithosServer:
                                 )
                             )
                     else:
-                        doc, _ = await self.knowledge.read(path=str(relative_path))
+                        doc = await self.knowledge.sync_from_disk(relative_path)
                         self.search.index_document(doc)
                         self.graph.add_document(doc)
                         self.graph.save_cache()
@@ -218,6 +280,7 @@ class LithosServer:
             id: str | None = None,
             source_task: str | None = None,
             source_url: str | None = None,
+            derived_from_ids: list[str] | None = None,
         ) -> dict[str, Any]:
             """Create or update a knowledge file.
 
@@ -232,6 +295,9 @@ class LithosServer:
                 source_task: Task ID this knowledge came from
                 source_url: URL provenance for this knowledge. Pass "" to clear an
                     existing source_url on update.
+                derived_from_ids: List of source document UUIDs this note was derived
+                    from. On update: None (omit) preserves existing; [] clears;
+                    non-empty list replaces.
 
             Returns:
                 Dict with status envelope: created/updated/duplicate
@@ -249,7 +315,8 @@ class LithosServer:
 
                 if id:
                     # Update existing — map MCP boundary to manager semantics:
-                    # None (omitted) → _UNSET (preserve), "" → None (clear), str → pass through
+                    # source_url: None (omitted) → _UNSET (preserve), "" → None (clear),
+                    #             str → pass through
                     url_arg: str | None | _UnsetType
                     if source_url is None:
                         url_arg = _UNSET
@@ -257,6 +324,13 @@ class LithosServer:
                         url_arg = None
                     else:
                         url_arg = source_url
+
+                    # derived_from_ids: None (omitted) → _UNSET (preserve),
+                    #                   [] → [] (clear), non-empty → pass through
+                    prov_arg: list[str] | None | _UnsetType = (
+                        _UNSET if derived_from_ids is None else derived_from_ids
+                    )
+
                     result = await self.knowledge.update(
                         id=id,
                         agent=agent,
@@ -265,6 +339,7 @@ class LithosServer:
                         tags=tags,
                         confidence=confidence,
                         source_url=url_arg,
+                        derived_from_ids=prov_arg,
                     )
                 else:
                     # Create new — default confidence to 1.0 when not specified
@@ -277,31 +352,37 @@ class LithosServer:
                         path=path,
                         source=source_task,
                         source_url=source_url or None,
+                        derived_from_ids=derived_from_ids,
                     )
 
-                # Handle dict results (duplicate or invalid_input)
-                if isinstance(result, dict):
-                    status = result.get("status", "error")
-                    if status == "duplicate":
-                        span.set_attribute("lithos.write_status", "duplicate")
-                        return {
-                            "status": "duplicate",
-                            "duplicate_of": result["duplicate_of"],
-                            "message": result["message"],
-                            "warnings": warnings,
+                # Handle non-success results via WriteResult fields
+                if result.status == "duplicate":
+                    span.set_attribute("lithos.write_status", "duplicate")
+                    dup = result.duplicate_of
+                    return {
+                        "status": "duplicate",
+                        "duplicate_of": {
+                            "id": dup.id,
+                            "title": dup.title,
+                            "source_url": dup.source_url,
                         }
-                    elif status == "invalid_input":
-                        span.set_attribute("lithos.write_status", "invalid_input")
-                        return {
-                            "status": "error",
-                            "code": "invalid_input",
-                            "message": result["message"],
-                            "warnings": warnings,
-                        }
+                        if dup
+                        else None,
+                        "message": result.message,
+                        "warnings": warnings + result.warnings,
+                    }
+                elif result.status == "error":
+                    span.set_attribute("lithos.write_status", "error")
+                    return {
+                        "status": "error",
+                        "code": result.error_code,
+                        "message": result.message,
+                        "warnings": warnings + result.warnings,
+                    }
 
-                assert isinstance(result, KnowledgeDocument)
-                doc = result
-                status_label = "updated" if id else "created"
+                doc = result.document
+                assert doc is not None
+                warnings.extend(result.warnings)
 
                 # Update indices
                 self.search.index_document(doc)
@@ -309,8 +390,14 @@ class LithosServer:
                 self.graph.save_cache()
 
                 span.set_attribute("lithos.doc_id", doc.id)
-                span.set_attribute("lithos.write_status", status_label)
-                logger.info("lithos_write completed doc_id=%s status=%s", doc.id, status_label)
+                span.set_attribute("lithos.write_status", result.status)
+                span.set_attribute(
+                    "lithos.provenance.source_count",
+                    len(doc.metadata.derived_from_ids),
+                )
+                if result.warnings:
+                    span.set_attribute("lithos.provenance.warning_count", len(result.warnings))
+                logger.info("lithos_write completed doc_id=%s status=%s", doc.id, result.status)
 
                 await self._emit(
                     LithosEvent(
@@ -322,7 +409,7 @@ class LithosServer:
                 )
 
                 return {
-                    "status": status_label,
+                    "status": result.status,
                     "id": doc.id,
                     "path": str(doc.path),
                     "warnings": warnings,
@@ -360,6 +447,7 @@ class LithosServer:
                 span.set_attribute("lithos.truncated", truncated)
                 meta = doc.metadata.to_dict()
                 meta["source_url"] = doc.metadata.source_url  # null when None
+                meta.setdefault("derived_from_ids", [])
                 return {
                     "id": doc.id,
                     "title": doc.title,
@@ -463,6 +551,7 @@ class LithosServer:
                             "source_url": r.source_url,
                             "updated_at": r.updated_at,
                             "is_stale": r.is_stale,
+                            "derived_from_ids": self.knowledge.get_doc_sources(r.id),
                         }
                         for r in results
                     ]
@@ -517,6 +606,7 @@ class LithosServer:
                             "source_url": r.source_url,
                             "updated_at": r.updated_at,
                             "is_stale": r.is_stale,
+                            "derived_from_ids": self.knowledge.get_doc_sources(r.id),
                         }
                         for r in results
                     ]
@@ -574,6 +664,7 @@ class LithosServer:
                             "updated": d.metadata.updated_at.isoformat(),
                             "tags": d.metadata.tags,
                             "source_url": d.metadata.source_url or "",
+                            "derived_from_ids": self.knowledge.get_doc_sources(d.id),
                         }
                         for d in docs
                     ],
@@ -619,6 +710,65 @@ class LithosServer:
                     "outgoing": [{"id": link.id, "title": link.title} for link in links.outgoing],
                     "incoming": [{"id": link.id, "title": link.title} for link in links.incoming],
                 }
+
+        @self.mcp.tool()
+        async def lithos_provenance(
+            id: str,
+            direction: str = "both",
+            depth: int = 1,
+            include_unresolved: bool = True,
+        ) -> dict[str, Any]:
+            """Query document lineage via provenance indexes.
+
+            Args:
+                id: Document UUID
+                direction: "sources", "derived", or "both"
+                depth: BFS traversal depth 1-3 (default: 1)
+                include_unresolved: Include unresolved source UUIDs (default: True)
+
+            Returns:
+                Dict with id, sources, derived, and optionally unresolved_sources
+            """
+            logger.info("lithos_provenance id=%s direction=%s depth=%d", id, direction, depth)
+            tracer = get_tracer()
+            with tracer.start_as_current_span("lithos.tool.provenance") as span:
+                span.set_attribute("lithos.tool", "lithos_provenance")
+                span.set_attribute("lithos.id", id)
+                span.set_attribute("lithos.direction", direction)
+                span.set_attribute("lithos.depth", depth)
+
+                if not self.knowledge.has_document(id):
+                    return {
+                        "status": "error",
+                        "code": "doc_not_found",
+                        "message": f"Document not found: {id}",
+                    }
+
+                if direction not in ("sources", "derived", "both"):
+                    direction = "both"
+
+                depth = min(max(depth, 1), 3)
+
+                sources: list[dict[str, str]] = []
+                derived: list[dict[str, str]] = []
+
+                if direction in ("sources", "both"):
+                    sources = self._bfs_provenance(id, "sources", depth)
+                if direction in ("derived", "both"):
+                    derived = self._bfs_provenance(id, "derived", depth)
+
+                result: dict[str, Any] = {
+                    "id": id,
+                    "sources": sources,
+                    "derived": derived,
+                }
+
+                if include_unresolved:
+                    result["unresolved_sources"] = sorted(self.knowledge.get_unresolved_sources(id))
+
+                span.set_attribute("lithos.sources_count", len(sources))
+                span.set_attribute("lithos.derived_count", len(derived))
+                return result
 
         @self.mcp.tool()
         async def lithos_tags() -> dict[str, dict[str, int]]:

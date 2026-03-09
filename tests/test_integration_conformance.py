@@ -378,12 +378,14 @@ class TestFileWatcherRace:
 
     @pytest.mark.asyncio
     async def test_rapid_update_then_delete_keeps_indices_consistent(self, server: LithosServer):
-        doc = await server.knowledge.create(
-            title="Watcher Race Doc",
-            content="initial",
-            agent="race-agent",
-            path="watched",
-        )
+        doc = (
+            await server.knowledge.create(
+                title="Watcher Race Doc",
+                content="initial",
+                agent="race-agent",
+                path="watched",
+            )
+        ).document
         server.search.index_document(doc)
         server.graph.add_document(doc)
 
@@ -2044,6 +2046,850 @@ class TestSourceUrlMCPResponses:
         stats = await _call_tool(server, "lithos_stats", {})
         assert "duplicate_urls" in stats
         assert isinstance(stats["duplicate_urls"], int)
+
+
+class TestDerivedFromIdsMCPBoundary:
+    """Integration tests for US-008: derived_from_ids through lithos_write MCP tool."""
+
+    @pytest.mark.asyncio
+    async def test_create_with_derived_from_ids(self, server: LithosServer):
+        """lithos_write create with derived_from_ids stores and reads back."""
+        src = await _call_tool(
+            server,
+            "lithos_write",
+            {
+                "title": "Provenance Source",
+                "content": "Source document.",
+                "agent": "prov-agent",
+            },
+        )
+        src_id = src["id"]
+
+        derived = await _call_tool(
+            server,
+            "lithos_write",
+            {
+                "title": "Provenance Derived",
+                "content": "Derived from source.",
+                "agent": "prov-agent",
+                "derived_from_ids": [src_id],
+            },
+        )
+        assert derived["status"] == "created"
+
+        read = await _call_tool(server, "lithos_read", {"id": derived["id"]})
+        assert read["metadata"]["derived_from_ids"] == [src_id]
+
+    @pytest.mark.asyncio
+    async def test_update_omit_preserves_derived_from_ids(self, server: LithosServer):
+        """lithos_write update without derived_from_ids preserves existing."""
+        src = await _call_tool(
+            server,
+            "lithos_write",
+            {
+                "title": "Preserve Source",
+                "content": "Source.",
+                "agent": "prov-agent",
+            },
+        )
+
+        doc = await _call_tool(
+            server,
+            "lithos_write",
+            {
+                "title": "Preserve Derived",
+                "content": "Derived.",
+                "agent": "prov-agent",
+                "derived_from_ids": [src["id"]],
+            },
+        )
+
+        # Update without passing derived_from_ids (None at MCP boundary = preserve)
+        await _call_tool(
+            server,
+            "lithos_write",
+            {
+                "id": doc["id"],
+                "title": "Preserve Derived",
+                "content": "Updated content.",
+                "agent": "prov-agent",
+            },
+        )
+
+        read = await _call_tool(server, "lithos_read", {"id": doc["id"]})
+        assert read["metadata"]["derived_from_ids"] == [src["id"]]
+
+    @pytest.mark.asyncio
+    async def test_update_clear_derived_from_ids(self, server: LithosServer):
+        """lithos_write update with derived_from_ids=[] clears provenance."""
+        src = await _call_tool(
+            server,
+            "lithos_write",
+            {
+                "title": "Clear Source",
+                "content": "Source.",
+                "agent": "prov-agent",
+            },
+        )
+
+        doc = await _call_tool(
+            server,
+            "lithos_write",
+            {
+                "title": "Clear Derived",
+                "content": "Derived.",
+                "agent": "prov-agent",
+                "derived_from_ids": [src["id"]],
+            },
+        )
+
+        # Clear by passing empty list
+        await _call_tool(
+            server,
+            "lithos_write",
+            {
+                "id": doc["id"],
+                "title": "Clear Derived",
+                "content": "Cleared.",
+                "agent": "prov-agent",
+                "derived_from_ids": [],
+            },
+        )
+
+        read = await _call_tool(server, "lithos_read", {"id": doc["id"]})
+        # to_dict() omits empty lists, so key may be absent
+        assert read["metadata"].get("derived_from_ids", []) == []
+
+    @pytest.mark.asyncio
+    async def test_update_replace_derived_from_ids(self, server: LithosServer):
+        """lithos_write update with non-empty derived_from_ids replaces."""
+        s1 = await _call_tool(
+            server,
+            "lithos_write",
+            {"title": "Replace S1", "content": "S1.", "agent": "prov-agent"},
+        )
+        s2 = await _call_tool(
+            server,
+            "lithos_write",
+            {"title": "Replace S2", "content": "S2.", "agent": "prov-agent"},
+        )
+
+        doc = await _call_tool(
+            server,
+            "lithos_write",
+            {
+                "title": "Replace Derived",
+                "content": "Derived.",
+                "agent": "prov-agent",
+                "derived_from_ids": [s1["id"]],
+            },
+        )
+
+        # Replace s1 with s2
+        await _call_tool(
+            server,
+            "lithos_write",
+            {
+                "id": doc["id"],
+                "title": "Replace Derived",
+                "content": "Replaced.",
+                "agent": "prov-agent",
+                "derived_from_ids": [s2["id"]],
+            },
+        )
+
+        read = await _call_tool(server, "lithos_read", {"id": doc["id"]})
+        assert read["metadata"]["derived_from_ids"] == [s2["id"]]
+
+    @pytest.mark.asyncio
+    async def test_create_with_unresolved_returns_warnings(self, server: LithosServer):
+        """lithos_write create with missing source IDs returns warnings."""
+        fake_id = "00000000-0000-0000-0000-111111111111"
+        result = await _call_tool(
+            server,
+            "lithos_write",
+            {
+                "title": "Unresolved Provenance",
+                "content": "References missing source.",
+                "agent": "prov-agent",
+                "derived_from_ids": [fake_id],
+            },
+        )
+        assert result["status"] == "created"
+        assert any(fake_id in w for w in result["warnings"])
+
+    @pytest.mark.asyncio
+    async def test_create_with_invalid_uuid_returns_error(self, server: LithosServer):
+        """lithos_write create with invalid UUID in derived_from_ids returns error."""
+        result = await _call_tool(
+            server,
+            "lithos_write",
+            {
+                "title": "Invalid UUID Provenance",
+                "content": "Bad reference.",
+                "agent": "prov-agent",
+                "derived_from_ids": ["not-a-uuid"],
+            },
+        )
+        assert result["status"] == "error"
+        assert result["code"] == "invalid_input"
+
+
+class TestSyncFromDisk:
+    """Integration tests for US-009: sync_from_disk provenance index maintenance."""
+
+    @pytest.mark.asyncio
+    async def test_external_create_with_derived_from_ids(self, server: LithosServer):
+        """Externally created file with derived_from_ids updates provenance indexes."""
+        import uuid
+
+        # Create a source doc via MCP
+        src = await _call_tool(
+            server,
+            "lithos_write",
+            {
+                "title": "Sync Source",
+                "content": "Source document.",
+                "agent": "sync-agent",
+            },
+        )
+        src_id = src["id"]
+
+        # Externally create a file on disk with derived_from_ids
+        doc_id = str(uuid.uuid4())
+        post = frontmatter.Post(
+            "# External Derived\n\nDerived from source via external file.",
+            id=doc_id,
+            title="External Derived",
+            author="external",
+            created_at="2026-03-08T00:00:00+00:00",
+            updated_at="2026-03-08T00:00:00+00:00",
+            tags=[],
+            aliases=[],
+            confidence=1.0,
+            contributors=[],
+            source=None,
+            supersedes=None,
+            derived_from_ids=[src_id],
+        )
+        knowledge_path = server.config.storage.knowledge_path
+        file_path = knowledge_path / "external-derived.md"
+        file_path.write_text(frontmatter.dumps(post))
+
+        # Call handle_file_change to simulate watcher
+        await server.handle_file_change(file_path, deleted=False)
+
+        # Verify provenance indexes are updated
+        assert doc_id in server.knowledge._doc_to_sources
+        assert server.knowledge._doc_to_sources[doc_id] == [src_id]
+        assert doc_id in server.knowledge._source_to_derived.get(src_id, set())
+        assert server.knowledge._id_to_title[doc_id] == "External Derived"
+
+    @pytest.mark.asyncio
+    async def test_external_modify_derived_from_ids(self, server: LithosServer):
+        """Externally modifying derived_from_ids in a file updates indexes."""
+        # Create source docs and a derived doc via MCP
+        s1 = await _call_tool(
+            server,
+            "lithos_write",
+            {"title": "Modify Source 1", "content": "S1.", "agent": "sync-agent"},
+        )
+        s2 = await _call_tool(
+            server,
+            "lithos_write",
+            {"title": "Modify Source 2", "content": "S2.", "agent": "sync-agent"},
+        )
+        derived = await _call_tool(
+            server,
+            "lithos_write",
+            {
+                "title": "Modifiable Derived",
+                "content": "Derived from S1.",
+                "agent": "sync-agent",
+                "derived_from_ids": [s1["id"]],
+            },
+        )
+        derived_id = derived["id"]
+        derived_path_str = derived["path"]
+
+        # Verify initial provenance
+        assert server.knowledge._doc_to_sources[derived_id] == [s1["id"]]
+        assert derived_id in server.knowledge._source_to_derived.get(s1["id"], set())
+
+        # Externally modify the file's derived_from_ids on disk
+        knowledge_path = server.config.storage.knowledge_path
+        file_path = knowledge_path / derived_path_str
+        post = frontmatter.load(str(file_path))
+        post.metadata["derived_from_ids"] = [s2["id"]]
+        file_path.write_text(frontmatter.dumps(post))
+
+        # Simulate watcher event
+        await server.handle_file_change(file_path, deleted=False)
+
+        # Verify indexes updated: s1 removed, s2 added
+        assert server.knowledge._doc_to_sources[derived_id] == [s2["id"]]
+        assert derived_id not in server.knowledge._source_to_derived.get(s1["id"], set())
+        assert derived_id in server.knowledge._source_to_derived.get(s2["id"], set())
+
+    @pytest.mark.asyncio
+    async def test_external_title_change_updates_id_to_title(self, server: LithosServer):
+        """Externally changing a file's title updates _id_to_title."""
+        doc = await _call_tool(
+            server,
+            "lithos_write",
+            {
+                "title": "Original Title",
+                "content": "Content.",
+                "agent": "sync-agent",
+            },
+        )
+        doc_id = doc["id"]
+        doc_path_str = doc["path"]
+
+        assert server.knowledge._id_to_title[doc_id] == "Original Title"
+
+        # Externally modify the title on disk
+        knowledge_path = server.config.storage.knowledge_path
+        file_path = knowledge_path / doc_path_str
+        post = frontmatter.load(str(file_path))
+        post.metadata["title"] = "Changed Title"
+        # Also update H1 to match
+        post.content = "# Changed Title\n\nContent."
+        file_path.write_text(frontmatter.dumps(post))
+
+        await server.handle_file_change(file_path, deleted=False)
+
+        assert server.knowledge._id_to_title[doc_id] == "Changed Title"
+
+    @pytest.mark.asyncio
+    async def test_external_delete_source_marks_unresolved(self, server: LithosServer):
+        """Externally deleting a source doc marks provenance as unresolved."""
+        # Create source + derived via MCP
+        src = await _call_tool(
+            server,
+            "lithos_write",
+            {"title": "Deletable Source", "content": "Source.", "agent": "sync-agent"},
+        )
+        src_id = src["id"]
+        src_path_str = src["path"]
+
+        derived = await _call_tool(
+            server,
+            "lithos_write",
+            {
+                "title": "Orphanable Derived",
+                "content": "Derived from deletable source.",
+                "agent": "sync-agent",
+                "derived_from_ids": [src_id],
+            },
+        )
+        derived_id = derived["id"]
+
+        # Verify initial state
+        assert derived_id in server.knowledge._source_to_derived.get(src_id, set())
+
+        # Externally delete the source file
+        knowledge_path = server.config.storage.knowledge_path
+        src_file = knowledge_path / src_path_str
+        src_file.unlink()
+
+        await server.handle_file_change(src_file, deleted=True)
+
+        # Source should be removed from indexes
+        assert src_id not in server.knowledge._id_to_path
+        assert src_id not in server.knowledge._id_to_title
+
+        # Derived doc's provenance should now be unresolved
+        assert derived_id in server.knowledge._unresolved_provenance.get(src_id, set())
+        assert src_id not in server.knowledge._source_to_derived
+
+    @pytest.mark.asyncio
+    async def test_sync_from_disk_auto_resolves_unresolved(self, server: LithosServer):
+        """Externally creating a file that matches an unresolved ref auto-resolves it."""
+        import uuid
+
+        # Create a derived doc that references a not-yet-existing source
+        future_source_id = str(uuid.uuid4())
+        derived = await _call_tool(
+            server,
+            "lithos_write",
+            {
+                "title": "Waiting Derived",
+                "content": "Waiting for source to appear.",
+                "agent": "sync-agent",
+                "derived_from_ids": [future_source_id],
+            },
+        )
+        derived_id = derived["id"]
+
+        # Verify unresolved
+        assert derived_id in server.knowledge._unresolved_provenance.get(future_source_id, set())
+
+        # Now externally create the source file with the matching ID
+        post = frontmatter.Post(
+            "# Future Source\n\nNow exists on disk.",
+            id=future_source_id,
+            title="Future Source",
+            author="external",
+            created_at="2026-03-08T00:00:00+00:00",
+            updated_at="2026-03-08T00:00:00+00:00",
+            tags=[],
+            aliases=[],
+            confidence=1.0,
+            contributors=[],
+            source=None,
+            supersedes=None,
+        )
+        knowledge_path = server.config.storage.knowledge_path
+        file_path = knowledge_path / "future-source.md"
+        file_path.write_text(frontmatter.dumps(post))
+
+        await server.handle_file_change(file_path, deleted=False)
+
+        # Unresolved should now be resolved
+        assert future_source_id not in server.knowledge._unresolved_provenance
+        assert derived_id in server.knowledge._source_to_derived.get(future_source_id, set())
+
+    @pytest.mark.asyncio
+    async def test_sync_from_disk_error_does_not_crash_watcher(self, server: LithosServer):
+        """File watcher provenance errors are caught and logged, never crash."""
+        knowledge_path = server.config.storage.knowledge_path
+
+        # Create a malformed file
+        bad_file = knowledge_path / "malformed-sync.md"
+        bad_file.write_bytes(b"\x00\x01\x02\xff\xfe")
+
+        # Should not raise
+        await server.handle_file_change(bad_file, deleted=False)
+
+        # Verify server is still functional
+        result = await _call_tool(
+            server,
+            "lithos_write",
+            {
+                "title": "Post Error Doc",
+                "content": "Server still works.",
+                "agent": "sync-agent",
+            },
+        )
+        assert result["status"] == "created"
+
+
+class TestRebuildIndicesProvenance:
+    """Tests for US-010: _rebuild_indices provenance support."""
+
+    async def test_rebuild_indices_restores_provenance_indexes(self, server: LithosServer):
+        """After _rebuild_indices(), provenance indexes match on-disk state."""
+        # Create source doc
+        source_result = await _call_tool(
+            server,
+            "lithos_write",
+            {
+                "title": "Rebuild Source",
+                "content": "Source content.",
+                "agent": "rebuild-agent",
+            },
+        )
+        assert source_result["status"] == "created"
+        source_id = source_result["id"]
+
+        # Create derived doc referencing the source
+        derived_result = await _call_tool(
+            server,
+            "lithos_write",
+            {
+                "title": "Rebuild Derived",
+                "content": "Derived content.",
+                "agent": "rebuild-agent",
+                "derived_from_ids": [source_id],
+            },
+        )
+        assert derived_result["status"] == "created"
+        derived_id = derived_result["id"]
+
+        # Verify provenance indexes before rebuild
+        mgr = server.knowledge
+        assert mgr._doc_to_sources.get(derived_id) == [source_id]
+        assert derived_id in mgr._source_to_derived.get(source_id, set())
+        assert mgr._id_to_title.get(source_id) == "Rebuild Source"
+        assert mgr._id_to_title.get(derived_id) == "Rebuild Derived"
+
+        # Rebuild indices
+        await server._rebuild_indices()
+
+        # Verify provenance indexes are restored after rebuild
+        assert mgr._doc_to_sources.get(derived_id) == [source_id]
+        assert derived_id in mgr._source_to_derived.get(source_id, set())
+        assert mgr._id_to_title.get(source_id) == "Rebuild Source"
+        assert mgr._id_to_title.get(derived_id) == "Rebuild Derived"
+        assert not mgr._unresolved_provenance  # no unresolved refs
+
+    async def test_rebuild_indices_detects_unresolved_provenance(self, server: LithosServer):
+        """After _rebuild_indices(), unresolved references are correctly detected."""
+        missing_id = "00000000-0000-0000-0000-000000000099"
+
+        # Create a doc referencing a non-existent source
+        result = await _call_tool(
+            server,
+            "lithos_write",
+            {
+                "title": "Unresolved After Rebuild",
+                "content": "References a missing doc.",
+                "agent": "rebuild-agent",
+                "derived_from_ids": [missing_id],
+            },
+        )
+        assert result["status"] == "created"
+        doc_id = result["id"]
+
+        # Rebuild indices
+        await server._rebuild_indices()
+
+        # Verify unresolved provenance is detected
+        mgr = server.knowledge
+        assert mgr._doc_to_sources.get(doc_id) == [missing_id]
+        assert doc_id in mgr._unresolved_provenance.get(missing_id, set())
+        assert missing_id not in mgr._source_to_derived
+
+    async def test_rebuild_indices_clears_stale_provenance(self, server: LithosServer):
+        """_rebuild_indices() clears stale provenance from a previous rebuild."""
+        # Create a doc with provenance
+        source_result = await _call_tool(
+            server,
+            "lithos_write",
+            {
+                "title": "Stale Source",
+                "content": "Source.",
+                "agent": "rebuild-agent",
+            },
+        )
+        source_id = source_result["id"]
+
+        derived_result = await _call_tool(
+            server,
+            "lithos_write",
+            {
+                "title": "Stale Derived",
+                "content": "Derived.",
+                "agent": "rebuild-agent",
+                "derived_from_ids": [source_id],
+            },
+        )
+        derived_id = derived_result["id"]
+
+        # Delete the derived doc from disk (simulating external deletion)
+        mgr = server.knowledge
+        derived_path = mgr._id_to_path[derived_id]
+        full_path = mgr.knowledge_path / derived_path
+        full_path.unlink()
+
+        # Rebuild — should not have stale provenance entries for deleted doc
+        await server._rebuild_indices()
+
+        # The derived doc should no longer be in any indexes
+        assert derived_id not in mgr._doc_to_sources
+        assert derived_id not in mgr._source_to_derived.get(source_id, set())
+        assert derived_id not in mgr._id_to_title
+
+
+class TestLithosProvenance:
+    """Tests for US-011: lithos_provenance MCP tool."""
+
+    async def _create_doc(
+        self,
+        server: LithosServer,
+        title: str,
+        derived_from_ids: list[str] | None = None,
+    ) -> str:
+        """Helper to create a doc and return its ID."""
+        args: dict[str, Any] = {
+            "title": title,
+            "content": f"Content of {title}.",
+            "agent": "prov-agent",
+        }
+        if derived_from_ids is not None:
+            args["derived_from_ids"] = derived_from_ids
+        result = await _call_tool(server, "lithos_write", args)
+        assert result["status"] == "created"
+        return result["id"]
+
+    async def test_single_depth_sources(self, server: LithosServer):
+        """direction='sources' returns immediate source documents."""
+        source_id = await self._create_doc(server, "Prov Source A")
+        derived_id = await self._create_doc(server, "Prov Derived A", derived_from_ids=[source_id])
+
+        result = await _call_tool(
+            server, "lithos_provenance", {"id": derived_id, "direction": "sources"}
+        )
+        assert result["id"] == derived_id
+        assert len(result["sources"]) == 1
+        assert result["sources"][0]["id"] == source_id
+        assert result["sources"][0]["title"] == "Prov Source A"
+        assert result["derived"] == []
+
+    async def test_single_depth_derived(self, server: LithosServer):
+        """direction='derived' returns immediate derived documents."""
+        source_id = await self._create_doc(server, "Prov Source B")
+        derived_id = await self._create_doc(server, "Prov Derived B", derived_from_ids=[source_id])
+
+        result = await _call_tool(
+            server, "lithos_provenance", {"id": source_id, "direction": "derived"}
+        )
+        assert result["id"] == source_id
+        assert result["sources"] == []
+        assert len(result["derived"]) == 1
+        assert result["derived"][0]["id"] == derived_id
+
+    async def test_multi_depth_bfs_chain(self, server: LithosServer):
+        """depth=2 BFS traverses A->B->C chain."""
+        a_id = await self._create_doc(server, "Chain A")
+        b_id = await self._create_doc(server, "Chain B", derived_from_ids=[a_id])
+        c_id = await self._create_doc(server, "Chain C", derived_from_ids=[b_id])
+
+        # From A, derived depth=2 should find B and C
+        result = await _call_tool(
+            server,
+            "lithos_provenance",
+            {"id": a_id, "direction": "derived", "depth": 2},
+        )
+        derived_ids = [n["id"] for n in result["derived"]]
+        assert b_id in derived_ids
+        assert c_id in derived_ids
+
+        # From C, sources depth=2 should find B and A
+        result = await _call_tool(
+            server,
+            "lithos_provenance",
+            {"id": c_id, "direction": "sources", "depth": 2},
+        )
+        source_ids = [n["id"] for n in result["sources"]]
+        assert b_id in source_ids
+        assert a_id in source_ids
+
+    async def test_cycle_handling(self, server: LithosServer):
+        """Cycles (A->B, B->A) don't cause infinite traversal."""
+        a_id = await self._create_doc(server, "Cycle A")
+        b_id = await self._create_doc(server, "Cycle B", derived_from_ids=[a_id])
+
+        # Now update A to also derive from B (creates a cycle)
+        await _call_tool(
+            server,
+            "lithos_write",
+            {
+                "title": "Cycle A",
+                "content": "Updated.",
+                "agent": "prov-agent",
+                "id": a_id,
+                "derived_from_ids": [b_id],
+            },
+        )
+
+        # Should return without hanging, depth=3 to maximize traversal
+        result = await _call_tool(
+            server,
+            "lithos_provenance",
+            {"id": a_id, "direction": "both", "depth": 3},
+        )
+        # Both A's sources and derived should include B
+        source_ids = [n["id"] for n in result["sources"]]
+        derived_ids = [n["id"] for n in result["derived"]]
+        assert b_id in source_ids
+        assert b_id in derived_ids
+
+    async def test_unresolved_sources_included(self, server: LithosServer):
+        """include_unresolved=True shows unresolved source UUIDs."""
+        missing_id = "00000000-0000-0000-0000-000000aaaaaa"
+        doc_id = await self._create_doc(server, "Unresolved Prov", derived_from_ids=[missing_id])
+
+        result = await _call_tool(
+            server,
+            "lithos_provenance",
+            {"id": doc_id, "include_unresolved": True},
+        )
+        assert missing_id in result["unresolved_sources"]
+
+    async def test_unresolved_sources_excluded(self, server: LithosServer):
+        """include_unresolved=False omits unresolved_sources key."""
+        missing_id = "00000000-0000-0000-0000-000000bbbbbb"
+        doc_id = await self._create_doc(server, "No Unresolved Prov", derived_from_ids=[missing_id])
+
+        result = await _call_tool(
+            server,
+            "lithos_provenance",
+            {"id": doc_id, "include_unresolved": False},
+        )
+        assert "unresolved_sources" not in result
+
+    async def test_unknown_id_returns_error(self, server: LithosServer):
+        """Unknown ID returns doc_not_found error."""
+        result = await _call_tool(
+            server,
+            "lithos_provenance",
+            {"id": "00000000-0000-0000-0000-ffffffffffff"},
+        )
+        assert result["status"] == "error"
+        assert result["code"] == "doc_not_found"
+
+    async def test_both_direction(self, server: LithosServer):
+        """direction='both' returns sources and derived."""
+        a_id = await self._create_doc(server, "Both Source")
+        b_id = await self._create_doc(server, "Both Middle", derived_from_ids=[a_id])
+        c_id = await self._create_doc(server, "Both Derived", derived_from_ids=[b_id])
+
+        result = await _call_tool(
+            server,
+            "lithos_provenance",
+            {"id": b_id, "direction": "both"},
+        )
+        source_ids = [n["id"] for n in result["sources"]]
+        derived_ids = [n["id"] for n in result["derived"]]
+        assert a_id in source_ids
+        assert c_id in derived_ids
+
+    async def test_results_sorted_by_id(self, server: LithosServer):
+        """Sources and derived lists are sorted by ID."""
+        s1 = await self._create_doc(server, "Sort Source 1")
+        s2 = await self._create_doc(server, "Sort Source 2")
+        doc_id = await self._create_doc(server, "Sort Derived", derived_from_ids=[s1, s2])
+
+        result = await _call_tool(
+            server,
+            "lithos_provenance",
+            {"id": doc_id, "direction": "sources"},
+        )
+        ids = [n["id"] for n in result["sources"]]
+        assert ids == sorted(ids)
+
+    async def test_depth_clamped(self, server: LithosServer):
+        """Depth values are clamped to 1-3."""
+        a_id = await self._create_doc(server, "Clamp A")
+        b_id = await self._create_doc(server, "Clamp B", derived_from_ids=[a_id])
+        c_id = await self._create_doc(server, "Clamp C", derived_from_ids=[b_id])
+        _d_id = await self._create_doc(server, "Clamp D", derived_from_ids=[c_id])
+
+        # depth=0 should be clamped to 1
+        result = await _call_tool(
+            server,
+            "lithos_provenance",
+            {"id": a_id, "direction": "derived", "depth": 0},
+        )
+        derived_ids = [n["id"] for n in result["derived"]]
+        assert b_id in derived_ids
+        # depth=1 should not reach C
+        assert c_id not in derived_ids
+
+        # depth=100 should be clamped to 3
+        result = await _call_tool(
+            server,
+            "lithos_provenance",
+            {"id": a_id, "direction": "derived", "depth": 100},
+        )
+        derived_ids = [n["id"] for n in result["derived"]]
+        # Should reach up to 3 levels deep
+        assert b_id in derived_ids
+        assert c_id in derived_ids
+
+
+class TestDerivedFromIdsInResponses:
+    """Tests for US-012: derived_from_ids in read/search/list responses."""
+
+    async def test_lithos_read_includes_derived_from_ids(self, server: LithosServer):
+        """lithos_read response metadata includes derived_from_ids."""
+        source_result = await _call_tool(
+            server,
+            "lithos_write",
+            {"title": "Read Source", "content": "Source.", "agent": "resp-agent"},
+        )
+        source_id = source_result["id"]
+
+        derived_result = await _call_tool(
+            server,
+            "lithos_write",
+            {
+                "title": "Read Derived",
+                "content": "Derived.",
+                "agent": "resp-agent",
+                "derived_from_ids": [source_id],
+            },
+        )
+        derived_id = derived_result["id"]
+
+        # Read derived doc
+        read_result = await _call_tool(server, "lithos_read", {"id": derived_id})
+        assert read_result["metadata"]["derived_from_ids"] == [source_id]
+
+        # Read source doc (no provenance)
+        read_result = await _call_tool(server, "lithos_read", {"id": source_id})
+        assert read_result["metadata"]["derived_from_ids"] == []
+
+    async def test_lithos_search_includes_derived_from_ids(self, server: LithosServer):
+        """lithos_search result items include derived_from_ids."""
+        source_result = await _call_tool(
+            server,
+            "lithos_write",
+            {
+                "title": "Search Prov Source",
+                "content": "Unique provenance search content zyx987.",
+                "agent": "resp-agent",
+            },
+        )
+        source_id = source_result["id"]
+
+        derived_result = await _call_tool(
+            server,
+            "lithos_write",
+            {
+                "title": "Search Prov Derived",
+                "content": "Unique provenance search derived zyx987.",
+                "agent": "resp-agent",
+                "derived_from_ids": [source_id],
+            },
+        )
+        derived_id = derived_result["id"]
+
+        await _wait_for_full_text_hit(server, "zyx987", derived_id)
+
+        search_result = await _call_tool(server, "lithos_search", {"query": "zyx987", "limit": 10})
+        found = [r for r in search_result["results"] if r["id"] == derived_id]
+        assert len(found) == 1
+        assert found[0]["derived_from_ids"] == [source_id]
+
+        # Source doc should have empty derived_from_ids
+        source_found = [r for r in search_result["results"] if r["id"] == source_id]
+        if source_found:
+            assert source_found[0]["derived_from_ids"] == []
+
+    async def test_lithos_list_includes_derived_from_ids(self, server: LithosServer):
+        """lithos_list result items include derived_from_ids."""
+        source_result = await _call_tool(
+            server,
+            "lithos_write",
+            {
+                "title": "List Prov Source",
+                "content": "Source.",
+                "agent": "resp-agent",
+                "tags": ["list-prov-test"],
+            },
+        )
+        source_id = source_result["id"]
+
+        derived_result = await _call_tool(
+            server,
+            "lithos_write",
+            {
+                "title": "List Prov Derived",
+                "content": "Derived.",
+                "agent": "resp-agent",
+                "tags": ["list-prov-test"],
+                "derived_from_ids": [source_id],
+            },
+        )
+        derived_id = derived_result["id"]
+
+        list_result = await _call_tool(server, "lithos_list", {"tags": ["list-prov-test"]})
+        items = {i["id"]: i for i in list_result["items"]}
+        assert items[derived_id]["derived_from_ids"] == [source_id]
+        assert items[source_id]["derived_from_ids"] == []
 
 
 def test_conformance_module_exists():
