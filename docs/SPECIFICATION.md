@@ -1,7 +1,7 @@
 # Lithos - Specification
 
-Version: 0.5.0
-Date: 2026-03-08
+Version: 0.6.0
+Date: 2026-03-09
 Status: Aligned with Implementation
 
 ---
@@ -160,6 +160,7 @@ source_url: <string>              # Optional: Canonical URL provenance (normaliz
 derived_from_ids:                 # Optional: Declared lineage (list of UUIDs)
   - <uuid-1>
   - <uuid-2>
+expires_at: <ISO 8601 datetime>   # Optional: Freshness deadline (UTC); null = never expires
 supersedes: <uuid>                # Optional: ID of document this replaces
 ---
 
@@ -289,6 +290,8 @@ Create or update a knowledge file.
 
 `{ status: "duplicate", duplicate_of: { id, title, source_url }, message: string, warnings: string[] }`
 
+`{ status: "error", code: "invalid_input", message: string, warnings: [] }`
+
 **Behavior on update:** If `id` is provided and exists, the agent is added to `contributors` if not already present.
 
 **Update semantics:** Omitted optional fields preserve existing values. Some fields support explicit clear. At the MCP boundary, FastMCP cannot distinguish omitted from `null`, so clearable string fields use `""` (empty string) as the clear signal (e.g., `source_url: ""`). See `unified-write-contract.md` for the full MCP boundary convention.
@@ -336,7 +339,7 @@ Full-text search across knowledge base.
 
 **Returns:** `{ results: [{ id, title, snippet, score, path, source_url, updated_at, is_stale, derived_from_ids }] }`
 
-**Snippet source:** Tantivy-generated highlight showing matching terms in context.
+**Snippet source:** Snippet showing matching terms in context.
 
 #### `lithos_semantic`
 Semantic similarity search.
@@ -354,6 +357,64 @@ Semantic similarity search.
 **Snippet source:** Content of the best-matching chunk for each document.
 
 **Note:** Search operates on chunks internally but returns deduplicated documents.
+
+#### `lithos_cache_lookup`
+Check the knowledge base for a cached answer before performing expensive research.
+
+**Arguments:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `query` | string | Yes | Natural language query for semantic matching |
+| `source_url` | string | No | Exact URL to check first (fast path) |
+| `max_age_hours` | float | No | Reject documents older than N hours (by `updated_at`) |
+| `min_confidence` | float | No | Minimum confidence score (default: 0.5) |
+| `limit` | int | No | Max candidates to evaluate (default: 3) |
+| `tags` | string[] | No | Filter by tags |
+
+**Returns (hit):**
+```json
+{
+  "hit": true,
+  "document": { "id": "...", "title": "...", "content": "...", "source_url": "...", "confidence": 0.9, "updated_at": "...", "expires_at": "...", "tags": ["..."] },
+  "stale_exists": false,
+  "stale_id": null
+}
+```
+
+**Returns (miss with stale candidate):**
+```json
+{
+  "hit": false,
+  "document": null,
+  "stale_exists": true,
+  "stale_id": "<uuid>"
+}
+```
+
+**Returns (clean miss):**
+```json
+{
+  "hit": false,
+  "document": null,
+  "stale_exists": false,
+  "stale_id": null
+}
+```
+
+**Returns (error):**
+```json
+{ "status": "error", "code": "invalid_input", "message": "..." }
+```
+
+```json
+{ "status": "error", "code": "search_backend_error", "message": "..." }
+```
+
+**Evaluation pipeline:**
+1. **Fast path**: If `source_url` provided, exact URL lookup via `find_by_source_url()`, filtered by tags.
+2. **Semantic fallback**: If fast path misses, `semantic_search(threshold=0.0)` returns top candidates.
+3. **Candidate evaluation** (in order): confidence filter → staleness check (`expires_at`) → `max_age_hours` check → first passing candidate = hit.
+4. **Stale tracking**: If all candidates fail due to staleness, returns `stale_id` so the caller can update the stale document.
 
 #### `lithos_list`
 List knowledge items with filters.
@@ -404,7 +465,7 @@ Traverse provenance lineage (derived-from relationships) for a knowledge item.
 | `id` | string | Yes | UUID of knowledge item |
 | `direction` | string | No | "sources", "derived", or "both" (default: "both") |
 | `depth` | int | No | Traversal depth 1-3 (default: 1) |
-| `include_unresolved` | bool | No | Include unresolved source IDs (default: false) |
+| `include_unresolved` | bool | No | Include unresolved source IDs (default: true) |
 
 **Returns:**
 ```json
@@ -412,7 +473,7 @@ Traverse provenance lineage (derived-from relationships) for a knowledge item.
   "id": "<queried-uuid>",
   "sources": [{ "id": "<uuid>", "title": "<string>" }],
   "derived": [{ "id": "<uuid>", "title": "<string>" }],
-  "unresolved": ["<uuid>", ...]
+  "unresolved_sources": ["<uuid>", ...]
 }
 ```
 
@@ -422,7 +483,7 @@ Traverse provenance lineage (derived-from relationships) for a knowledge item.
 - `derived` walks the reverse index (what was derived from this?).
 - `depth` is clamped to 1-3. Depth > 1 follows multi-hop chains (e.g., A→B→C at depth 2).
 - Cycles are handled via a visited set — BFS terminates without infinite loops.
-- `unresolved` is only populated when `include_unresolved=true`. Contains source UUIDs that reference documents not currently in the knowledge base.
+- `unresolved_sources` is only populated when `include_unresolved=true` (the default). Contains source UUIDs that reference documents not currently in the knowledge base.
 - Returns `{ status: "error", code: "doc_not_found" }` for unknown IDs.
 - Results are sorted by ID for deterministic output.
 
@@ -596,20 +657,20 @@ Get knowledge base statistics.
 
 ## 6. Index Behavior
 
-### 6.1 Startup (Incremental Loading)
+### 6.1 Startup
 
-1. Load persisted Tantivy index from `.tantivy/`
-2. Load persisted ChromaDB from `.chroma/`
-3. Load or rebuild NetworkX graph from `.graph/` cache
-4. Scan `knowledge/` directory for file changes:
-   - Compare file `mtime` against last indexed time
-   - Add new files to indices
-   - Update modified files in indices
-   - Remove deleted files from indices
-5. Load coordination state from `.lithos/coordination.db`
+1. Ensure data directories exist
+2. Initialize coordination database (`.lithos/coordination.db`)
+3. Check if Tantivy index needs rebuild (schema version mismatch)
+4. **Rebuild decision** (first matching condition wins):
+   - `rebuild_on_start` config flag is set → full rebuild
+   - Tantivy schema version requires rebuild → full rebuild
+   - NetworkX graph cache (`.graph/graph.pickle`) fails to load → full rebuild
+   - Graph cache loads successfully → use existing indices
+5. **Full rebuild** (when triggered): clear all indices, scan `knowledge/` directory, re-parse and re-index every `.md` file
 6. Start file watcher
 
-**Full rebuild** only when forced via `lithos reindex --clear`.
+**On-demand rebuild** via `lithos reindex --clear`.
 
 ### 6.2 File Change Handling
 
@@ -853,7 +914,7 @@ These are explicitly not part of the initial implementation but may be considere
 - Knowledge versioning (beyond git)
 - Multi-node deployment
 - Access control / namespaces
-- Knowledge expiration / TTL
+- ~~Knowledge expiration / TTL~~ (Implemented in Phase 4 via `expires_at`, `ttl_hours`, `lithos_cache_lookup`, and `is_stale` in search results)
 - Automated knowledge quality scoring
 - Contradictory knowledge resolution
 - Integration with external knowledge sources
@@ -925,13 +986,13 @@ These are explicitly not part of the initial implementation but may be considere
 
 | Category | Tools |
 |----------|-------|
-| Knowledge | `lithos_write`, `lithos_read`, `lithos_delete`, `lithos_search`, `lithos_semantic`, `lithos_list` |
+| Knowledge | `lithos_write`, `lithos_read`, `lithos_delete`, `lithos_search`, `lithos_semantic`, `lithos_list`, `lithos_cache_lookup` |
 | Graph | `lithos_links`, `lithos_tags`, `lithos_provenance` |
 | Agent | `lithos_agent_register`, `lithos_agent_info`, `lithos_agent_list` |
 | Coordination | `lithos_task_create`, `lithos_task_claim`, `lithos_task_renew`, `lithos_task_release`, `lithos_task_complete`, `lithos_task_status`, `lithos_finding_post`, `lithos_finding_list` |
 | System | `lithos_stats` |
 
-**Total: 21 MCP tools**
+**Total: 22 MCP tools**
 
 ---
 

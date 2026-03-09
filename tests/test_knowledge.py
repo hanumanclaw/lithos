@@ -2657,3 +2657,348 @@ class TestSyncFromDiskWriteLock:
         # Should be normalized
         assert mgr._doc_to_sources[derived_id] == [source_id]
         assert derived_id in mgr._source_to_derived.get(source_id, set())
+
+
+class TestExpiresAtField:
+    """Tests for expires_at field on KnowledgeMetadata."""
+
+    def test_expires_at_in_known_metadata_keys(self):
+        """expires_at is a recognised metadata key."""
+        from lithos.knowledge import _KNOWN_METADATA_KEYS
+
+        assert "expires_at" in _KNOWN_METADATA_KEYS
+
+    def test_metadata_expires_at_default_none(self):
+        """expires_at defaults to None."""
+        meta = KnowledgeMetadata(
+            id="test-id",
+            title="Test",
+            author="agent",
+            created_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(timezone.utc),
+        )
+        assert meta.expires_at is None
+
+    def test_is_stale_when_none(self):
+        """is_stale returns False when expires_at is None."""
+        meta = KnowledgeMetadata(
+            id="test-id",
+            title="Test",
+            author="agent",
+            created_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(timezone.utc),
+        )
+        assert meta.is_stale is False
+
+    def test_is_stale_when_expired(self):
+        """is_stale returns True when expires_at is in the past."""
+        from datetime import timedelta
+
+        meta = KnowledgeMetadata(
+            id="test-id",
+            title="Test",
+            author="agent",
+            created_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(timezone.utc),
+            expires_at=datetime.now(timezone.utc) - timedelta(hours=1),
+        )
+        assert meta.is_stale is True
+
+    def test_is_stale_when_not_expired(self):
+        """is_stale returns False when expires_at is in the future."""
+        from datetime import timedelta
+
+        meta = KnowledgeMetadata(
+            id="test-id",
+            title="Test",
+            author="agent",
+            created_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(timezone.utc),
+            expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+        )
+        assert meta.is_stale is False
+
+    def test_is_stale_timezone_aware_comparison(self):
+        """is_stale handles naive datetimes by treating them as UTC."""
+        from datetime import timedelta
+
+        # Naive datetime in the past should be treated as UTC and be stale
+        meta = KnowledgeMetadata(
+            id="test-id",
+            title="Test",
+            author="agent",
+            created_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(timezone.utc),
+            expires_at=datetime.utcnow() - timedelta(hours=1),
+        )
+        assert meta.is_stale is True
+
+    def test_to_dict_includes_expires_at_when_set(self):
+        """to_dict() includes expires_at as ISO 8601 string when set."""
+        from datetime import timedelta
+
+        expires = datetime.now(timezone.utc) + timedelta(hours=24)
+        meta = KnowledgeMetadata(
+            id="test-id",
+            title="Test",
+            author="agent",
+            created_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(timezone.utc),
+            expires_at=expires,
+        )
+        d = meta.to_dict()
+        assert d["expires_at"] == expires.isoformat()
+
+    def test_to_dict_omits_expires_at_when_none(self):
+        """to_dict() omits expires_at when None."""
+        meta = KnowledgeMetadata(
+            id="test-id",
+            title="Test",
+            author="agent",
+            created_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(timezone.utc),
+        )
+        d = meta.to_dict()
+        assert "expires_at" not in d
+
+    def test_from_dict_reads_expires_at_string(self):
+        """from_dict() parses expires_at from ISO 8601 string."""
+        from datetime import timedelta
+
+        expires = datetime.now(timezone.utc) + timedelta(hours=24)
+        data = {
+            "id": "test-id",
+            "title": "Test",
+            "author": "agent",
+            "expires_at": expires.isoformat(),
+        }
+        meta = KnowledgeMetadata.from_dict(data)
+        assert meta.expires_at == expires
+
+    def test_from_dict_reads_expires_at_datetime(self):
+        """from_dict() accepts datetime objects directly (e.g., from YAML)."""
+        from datetime import timedelta
+
+        expires = datetime.now(timezone.utc) + timedelta(hours=24)
+        data = {
+            "id": "test-id",
+            "title": "Test",
+            "author": "agent",
+            "expires_at": expires,
+        }
+        meta = KnowledgeMetadata.from_dict(data)
+        assert meta.expires_at == expires
+
+    def test_from_dict_defaults_expires_at_to_none(self):
+        """from_dict() defaults expires_at to None when absent."""
+        data = {"id": "test-id", "title": "Test", "author": "agent"}
+        meta = KnowledgeMetadata.from_dict(data)
+        assert meta.expires_at is None
+
+    def test_from_dict_expires_at_not_in_extra(self):
+        """expires_at is not captured in extra dict."""
+        from datetime import timedelta
+
+        data = {
+            "id": "test-id",
+            "title": "Test",
+            "author": "agent",
+            "expires_at": (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(),
+        }
+        meta = KnowledgeMetadata.from_dict(data)
+        assert "expires_at" not in meta.extra
+
+    def test_serialization_round_trip(self):
+        """expires_at survives to_dict -> from_dict round-trip."""
+        from datetime import timedelta
+
+        expires = datetime.now(timezone.utc) + timedelta(hours=24)
+        meta = KnowledgeMetadata(
+            id="test-id",
+            title="Test",
+            author="agent",
+            created_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(timezone.utc),
+            expires_at=expires,
+        )
+        d = meta.to_dict()
+        meta2 = KnowledgeMetadata.from_dict(d)
+        assert meta2.expires_at == expires
+
+    def test_existing_doc_without_expires_at(self):
+        """Documents without expires_at load with expires_at=None and is_stale=False."""
+        data = {
+            "id": "test-id",
+            "title": "Old Doc",
+            "author": "agent",
+            "tags": ["research"],
+        }
+        meta = KnowledgeMetadata.from_dict(data)
+        assert meta.expires_at is None
+        assert meta.is_stale is False
+
+
+class TestExpiresAtWritePath:
+    """Tests for expires_at in KnowledgeManager.create() and update()."""
+
+    @pytest.mark.asyncio
+    async def test_create_with_expires_at(self, knowledge_manager: KnowledgeManager):
+        """create() with expires_at stores it in metadata."""
+        from datetime import timedelta
+
+        expires = datetime.now(timezone.utc) + timedelta(hours=24)
+        result = await knowledge_manager.create(
+            title="Fresh Doc",
+            content="Fresh content.",
+            agent="agent",
+            expires_at=expires,
+        )
+        assert result.status == "created"
+        assert result.document is not None
+        assert result.document.metadata.expires_at == expires
+
+    @pytest.mark.asyncio
+    async def test_create_without_expires_at(self, knowledge_manager: KnowledgeManager):
+        """create() without expires_at defaults to None."""
+        result = await knowledge_manager.create(
+            title="No Expiry",
+            content="No expiry content.",
+            agent="agent",
+        )
+        assert result.status == "created"
+        assert result.document is not None
+        assert result.document.metadata.expires_at is None
+
+    @pytest.mark.asyncio
+    async def test_create_read_round_trip(self, knowledge_manager: KnowledgeManager, test_config):
+        """expires_at persists through create-read round trip."""
+        from datetime import timedelta
+
+        expires = datetime.now(timezone.utc) + timedelta(hours=48)
+        created = (
+            await knowledge_manager.create(
+                title="Round Trip",
+                content="Round trip content.",
+                agent="agent",
+                expires_at=expires,
+            )
+        ).document
+        assert created is not None
+
+        doc, _ = await knowledge_manager.read(id=created.id)
+        # Compare with tolerance for serialization precision
+        assert doc.metadata.expires_at is not None
+        assert abs((doc.metadata.expires_at - expires).total_seconds()) < 1
+
+        # Verify raw frontmatter on disk
+        import yaml
+
+        file_path = test_config.storage.knowledge_path / created.path
+        raw = file_path.read_text()
+        parts = raw.split("---", 2)
+        fm_data = yaml.safe_load(parts[1])
+        assert "expires_at" in fm_data
+
+    @pytest.mark.asyncio
+    async def test_update_preserve_expires_at(self, knowledge_manager: KnowledgeManager):
+        """update() with _UNSET preserves existing expires_at."""
+        from datetime import timedelta
+
+        expires = datetime.now(timezone.utc) + timedelta(hours=24)
+        doc = (
+            await knowledge_manager.create(
+                title="Preserve Test",
+                content="Content.",
+                agent="agent",
+                expires_at=expires,
+            )
+        ).document
+        assert doc is not None
+
+        # Update without touching expires_at (default is _UNSET)
+        result = await knowledge_manager.update(
+            id=doc.id,
+            agent="editor",
+            content="Updated content.",
+        )
+        assert result.status == "updated"
+        assert result.document is not None
+        assert result.document.metadata.expires_at == expires
+
+    @pytest.mark.asyncio
+    async def test_update_clear_expires_at(self, knowledge_manager: KnowledgeManager):
+        """update() with None clears existing expires_at."""
+        from datetime import timedelta
+
+        expires = datetime.now(timezone.utc) + timedelta(hours=24)
+        doc = (
+            await knowledge_manager.create(
+                title="Clear Test",
+                content="Content.",
+                agent="agent",
+                expires_at=expires,
+            )
+        ).document
+        assert doc is not None
+
+        result = await knowledge_manager.update(
+            id=doc.id,
+            agent="editor",
+            expires_at=None,
+        )
+        assert result.status == "updated"
+        assert result.document is not None
+        assert result.document.metadata.expires_at is None
+
+    @pytest.mark.asyncio
+    async def test_update_replace_expires_at(self, knowledge_manager: KnowledgeManager):
+        """update() with datetime replaces existing expires_at."""
+        from datetime import timedelta
+
+        old_expires = datetime.now(timezone.utc) + timedelta(hours=24)
+        new_expires = datetime.now(timezone.utc) + timedelta(hours=72)
+
+        doc = (
+            await knowledge_manager.create(
+                title="Replace Test",
+                content="Content.",
+                agent="agent",
+                expires_at=old_expires,
+            )
+        ).document
+        assert doc is not None
+
+        result = await knowledge_manager.update(
+            id=doc.id,
+            agent="editor",
+            expires_at=new_expires,
+        )
+        assert result.status == "updated"
+        assert result.document is not None
+        assert result.document.metadata.expires_at == new_expires
+
+    @pytest.mark.asyncio
+    async def test_update_read_round_trip(self, knowledge_manager: KnowledgeManager):
+        """expires_at persists through update-read round trip."""
+        from datetime import timedelta
+
+        doc = (
+            await knowledge_manager.create(
+                title="Update RT",
+                content="Content.",
+                agent="agent",
+            )
+        ).document
+        assert doc is not None
+        assert doc.metadata.expires_at is None
+
+        new_expires = datetime.now(timezone.utc) + timedelta(hours=12)
+        await knowledge_manager.update(
+            id=doc.id,
+            agent="editor",
+            expires_at=new_expires,
+        )
+
+        read_doc, _ = await knowledge_manager.read(id=doc.id)
+        assert read_doc.metadata.expires_at is not None
+        assert abs((read_doc.metadata.expires_at - new_expires).total_seconds()) < 1

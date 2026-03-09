@@ -49,6 +49,7 @@ _KNOWN_METADATA_KEYS = frozenset(
         "source_url",
         "supersedes",
         "derived_from_ids",
+        "expires_at",
     }
 )
 
@@ -192,7 +193,15 @@ class KnowledgeMetadata:
     source_url: str | None = None
     supersedes: str | None = None
     derived_from_ids: list[str] = field(default_factory=list)
+    expires_at: datetime | None = None
     extra: dict = field(default_factory=dict)
+
+    @property
+    def is_stale(self) -> bool:
+        """Return True when expires_at is set and in the past (UTC)."""
+        if self.expires_at is None:
+            return False
+        return datetime.now(timezone.utc) > _normalize_datetime(self.expires_at)
 
     def to_dict(self) -> dict:
         """Convert to dictionary for frontmatter.
@@ -216,6 +225,8 @@ class KnowledgeMetadata:
         }
         if self.source_url is not None:
             result["source_url"] = self.source_url
+        if self.expires_at is not None:
+            result["expires_at"] = self.expires_at.isoformat()
         if self.derived_from_ids:
             result["derived_from_ids"] = self.derived_from_ids
         # Merge unknown fields — known keys always take precedence.
@@ -243,6 +254,16 @@ class KnowledgeMetadata:
         elif updated_at is None:
             updated_at = datetime.now(timezone.utc)
 
+        expires_at = data.get("expires_at")
+        if isinstance(expires_at, str):
+            expires_at = datetime.fromisoformat(expires_at)
+            if expires_at.tzinfo is None:
+                expires_at = expires_at.replace(tzinfo=timezone.utc)
+            else:
+                expires_at = expires_at.astimezone(timezone.utc)
+        elif not isinstance(expires_at, datetime):
+            expires_at = None
+
         extra = {k: v for k, v in data.items() if k not in _KNOWN_METADATA_KEYS}
 
         return cls(
@@ -259,6 +280,7 @@ class KnowledgeMetadata:
             source_url=data.get("source_url"),
             supersedes=data.get("supersedes"),
             derived_from_ids=data.get("derived_from_ids", []),
+            expires_at=expires_at,
             extra=extra,
         )
 
@@ -596,6 +618,7 @@ class KnowledgeManager:
         source: str | None = None,
         source_url: str | None = None,
         derived_from_ids: list[str] | None = None,
+        expires_at: datetime | None = None,
     ) -> WriteResult:
         """Create a new knowledge document.
 
@@ -661,6 +684,7 @@ class KnowledgeManager:
                 source=source,
                 source_url=norm_url,
                 derived_from_ids=normalized_provenance,
+                expires_at=expires_at,
             )
 
             # Determine file path
@@ -819,6 +843,7 @@ class KnowledgeManager:
         confidence: float | None = None,
         source_url: str | None | _UnsetType = _UNSET,
         derived_from_ids: list[str] | None | _UnsetType = _UNSET,
+        expires_at: datetime | None | _UnsetType = _UNSET,
     ) -> WriteResult:
         """Update an existing document.
 
@@ -831,6 +856,11 @@ class KnowledgeManager:
         - _UNSET (default): preserve existing derived_from_ids, no index change
         - None or []: clear existing provenance, remove from all provenance indexes
         - non-empty list: validate, normalize, replace entire set
+
+        expires_at semantics:
+        - _UNSET (default): preserve existing expires_at
+        - None: clear existing expires_at
+        - datetime: set new value
         """
         async with self._write_lock:
             lithos_metrics.knowledge_ops.add(1, {"op": "update"})
@@ -926,6 +956,10 @@ class KnowledgeManager:
                             warnings.append(
                                 f"derived_from_ids contains missing document: {source_id}"
                             )
+
+            # Handle expires_at update
+            if not isinstance(expires_at, _UnsetType):
+                doc.metadata.expires_at = expires_at
 
             # Update fields
             if content is not None:
@@ -1042,7 +1076,7 @@ class KnowledgeManager:
         for doc_id, cached in self._meta_cache.items():
             if path_prefix and not str(cached.path).startswith(path_prefix):
                 continue
-            if tags and not any(t in cached.tags for t in tags):
+            if tags and not all(t in cached.tags for t in tags):
                 continue
             if author and cached.author != author:
                 continue

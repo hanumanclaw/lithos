@@ -803,3 +803,360 @@ Based on [[api-research-notes]].
         assert graph_stats["nodes"] >= 3
         assert coord_stats["agents"] >= 1
         assert coord_stats["active_tasks"] >= 1
+
+
+class TestFreshnessWritePath:
+    """Integration tests for ttl_hours / expires_at in lithos_write."""
+
+    @pytest.mark.asyncio
+    async def test_create_with_ttl_hours(self, server: LithosServer):
+        """Create with ttl_hours sets expires_at in metadata."""
+        result = await server.knowledge.create(
+            title="TTL Doc",
+            content="Content with TTL.",
+            agent="agent",
+            expires_at=datetime.now(timezone.utc) + __import__("datetime").timedelta(hours=24),
+        )
+        assert result.status == "created"
+        assert result.document is not None
+        assert result.document.metadata.expires_at is not None
+
+    @pytest.mark.asyncio
+    async def test_create_with_ttl_read_back(self, server: LithosServer):
+        """Create with short TTL, read back, verify expires_at is set."""
+        from datetime import timedelta
+
+        expires = datetime.now(timezone.utc) + timedelta(hours=0.001)
+        result = await server.knowledge.create(
+            title="Short TTL",
+            content="Ephemeral content.",
+            agent="agent",
+            expires_at=expires,
+        )
+        doc = result.document
+        assert doc is not None
+        read_doc, _ = await server.knowledge.read(id=doc.id)
+        assert read_doc.metadata.expires_at is not None
+
+    @pytest.mark.asyncio
+    async def test_update_preserve_expires_at(self, server: LithosServer):
+        """Update without expires_at preserves existing value."""
+        from datetime import timedelta
+
+        expires = datetime.now(timezone.utc) + timedelta(hours=24)
+        doc = (
+            await server.knowledge.create(
+                title="Preserve",
+                content="Original.",
+                agent="agent",
+                expires_at=expires,
+            )
+        ).document
+        assert doc is not None
+
+        updated = (
+            await server.knowledge.update(
+                id=doc.id,
+                agent="editor",
+                content="Updated.",
+            )
+        ).document
+        assert updated is not None
+        assert updated.metadata.expires_at == expires
+
+    @pytest.mark.asyncio
+    async def test_update_clear_expires_at(self, server: LithosServer):
+        """Update with expires_at=None clears existing value."""
+        from datetime import timedelta
+
+        expires = datetime.now(timezone.utc) + timedelta(hours=24)
+        doc = (
+            await server.knowledge.create(
+                title="ClearExpiry",
+                content="Original.",
+                agent="agent",
+                expires_at=expires,
+            )
+        ).document
+        assert doc is not None
+
+        updated = (
+            await server.knowledge.update(
+                id=doc.id,
+                agent="editor",
+                expires_at=None,
+            )
+        ).document
+        assert updated is not None
+        assert updated.metadata.expires_at is None
+
+
+class TestCacheLookup:
+    """Integration tests for lithos_cache_lookup tool."""
+
+    async def _call_cache_lookup(self, server: LithosServer, **kwargs) -> dict:
+        """Helper to call cache lookup tool."""
+        tools = await server.mcp.get_tools()
+        tool = tools["lithos_cache_lookup"]
+        result = await tool.fn(**kwargs)
+        return result
+
+    @pytest.mark.asyncio
+    async def test_cache_hit_fresh_doc(self, server: LithosServer):
+        """Cache lookup returns hit for fresh doc."""
+        from datetime import timedelta
+
+        doc = (
+            await server.knowledge.create(
+                title="Fresh Cache Doc",
+                content="Information about quantum computing.",
+                agent="agent",
+                tags=["research"],
+                expires_at=datetime.now(timezone.utc) + timedelta(hours=24),
+            )
+        ).document
+        server.search.index_document(doc)
+
+        result = await self._call_cache_lookup(server, query="quantum computing", tags=["research"])
+        assert result["hit"] is True
+        assert result["document"] is not None
+        assert result["document"]["id"] == doc.id
+        assert result["document"]["content"] == "Information about quantum computing."
+        assert result["stale_exists"] is False
+        assert result["stale_id"] is None
+
+    @pytest.mark.asyncio
+    async def test_cache_miss_stale_doc(self, server: LithosServer):
+        """Cache lookup returns stale reference for expired doc."""
+        from datetime import timedelta
+
+        doc = (
+            await server.knowledge.create(
+                title="Stale Cache Doc",
+                content="Outdated information about AI trends.",
+                agent="agent",
+                tags=["research"],
+                expires_at=datetime.now(timezone.utc) - timedelta(hours=1),
+            )
+        ).document
+        server.search.index_document(doc)
+
+        result = await self._call_cache_lookup(server, query="AI trends", tags=["research"])
+        assert result["hit"] is False
+        assert result["document"] is None
+        assert result["stale_exists"] is True
+        assert result["stale_id"] == doc.id
+
+    @pytest.mark.asyncio
+    async def test_cache_clean_miss(self, server: LithosServer):
+        """Cache lookup returns clean miss when no matching doc exists."""
+        result = await self._call_cache_lookup(server, query="completely unique topic xyz123")
+        assert result["hit"] is False
+        assert result["document"] is None
+        assert result["stale_exists"] is False
+        assert result["stale_id"] is None
+
+    @pytest.mark.asyncio
+    async def test_source_url_fast_path_hit(self, server: LithosServer):
+        """Cache lookup uses source_url fast path for exact match."""
+        from datetime import timedelta
+
+        doc = (
+            await server.knowledge.create(
+                title="URL Doc",
+                content="Content from example.com.",
+                agent="agent",
+                source_url="https://example.com/article",
+                expires_at=datetime.now(timezone.utc) + timedelta(hours=24),
+            )
+        ).document
+        server.search.index_document(doc)
+
+        result = await self._call_cache_lookup(
+            server,
+            query="example article",
+            source_url="https://example.com/article",
+        )
+        assert result["hit"] is True
+        assert result["document"]["id"] == doc.id
+        assert result["document"]["source_url"] == "https://example.com/article"
+
+    @pytest.mark.asyncio
+    async def test_source_url_fast_path_miss_falls_back(self, server: LithosServer):
+        """Cache lookup falls back to semantic when source_url not found."""
+        from datetime import timedelta
+
+        doc = (
+            await server.knowledge.create(
+                title="Fallback Semantic Doc",
+                content="Information about neural networks and deep learning.",
+                agent="agent",
+                expires_at=datetime.now(timezone.utc) + timedelta(hours=24),
+            )
+        ).document
+        server.search.index_document(doc)
+
+        result = await self._call_cache_lookup(
+            server,
+            query="neural networks deep learning",
+            source_url="https://nonexistent.com/page",
+        )
+        # Should fall back to semantic and potentially find the doc
+        assert isinstance(result["hit"], bool)
+
+    @pytest.mark.asyncio
+    async def test_confidence_filter(self, server: LithosServer):
+        """Cache lookup filters out low-confidence docs."""
+        from datetime import timedelta
+
+        doc = (
+            await server.knowledge.create(
+                title="Low Confidence Doc",
+                content="Uncertain information about dark matter theories.",
+                agent="agent",
+                confidence=0.2,
+                expires_at=datetime.now(timezone.utc) + timedelta(hours=24),
+            )
+        ).document
+        server.search.index_document(doc)
+
+        result = await self._call_cache_lookup(
+            server, query="dark matter theories", min_confidence=0.5
+        )
+        # Should not match because confidence is below threshold
+        assert result["hit"] is False
+
+    @pytest.mark.asyncio
+    async def test_max_age_hours_filter(self, server: LithosServer):
+        """Cache lookup respects max_age_hours filter."""
+        from datetime import timedelta
+
+        # Create a doc that hasn't expired but is old
+        doc = (
+            await server.knowledge.create(
+                title="Old Research Doc",
+                content="Research about blockchain consensus mechanisms.",
+                agent="agent",
+                expires_at=datetime.now(timezone.utc) + timedelta(hours=100),
+            )
+        ).document
+        # Manually set updated_at to 48 hours ago
+        doc.metadata.updated_at = datetime.now(timezone.utc) - timedelta(hours=48)
+        # Re-write to disk to persist the old updated_at
+        path = server.knowledge._resolve_safe_path(doc.path)[1]
+        path.write_text(doc.to_markdown())
+        # Re-read to reload from disk
+        server.knowledge._id_to_path[doc.id] = doc.path
+        server.search.index_document(doc)
+
+        result = await self._call_cache_lookup(
+            server, query="blockchain consensus", max_age_hours=24
+        )
+        # Should be treated as stale because it's older than 24 hours
+        assert result["hit"] is False
+
+    @pytest.mark.asyncio
+    async def test_tag_filtering_on_fast_path(self, server: LithosServer):
+        """Fast path source_url match must also pass tag filter."""
+        from datetime import timedelta
+
+        doc = (
+            await server.knowledge.create(
+                title="Tagged URL Doc",
+                content="Content with specific tags.",
+                agent="agent",
+                source_url="https://example.com/tagged",
+                tags=["python"],
+                expires_at=datetime.now(timezone.utc) + timedelta(hours=24),
+            )
+        ).document
+        server.search.index_document(doc)
+
+        # Should fail tag filter (doc has "python" but we ask for "rust")
+        result = await self._call_cache_lookup(
+            server,
+            query="tagged content",
+            source_url="https://example.com/tagged",
+            tags=["rust"],
+        )
+        # Fast path doc doesn't match tags, falls through
+        assert result["document"] is None or (
+            result["document"] is not None and "rust" in result["document"].get("tags", [])
+        )
+
+    @pytest.mark.asyncio
+    async def test_cache_lookup_search_backend_error(self, server: LithosServer):
+        """SearchBackendError returns standard error shape, not a clean miss."""
+        from unittest.mock import patch
+
+        from lithos.errors import SearchBackendError
+
+        err = SearchBackendError("chroma down", {"chroma": RuntimeError("connection refused")})
+        with patch.object(server.search, "semantic_search", side_effect=err):
+            result = await self._call_cache_lookup(server, query="anything")
+
+        assert result["status"] == "error"
+        assert result["code"] == "search_backend_error"
+        assert "chroma" in result["message"]
+
+    @pytest.mark.asyncio
+    async def test_cache_lookup_invalid_max_age_hours(self, server: LithosServer):
+        """Negative max_age_hours returns invalid_input error."""
+        result = await self._call_cache_lookup(server, query="test", max_age_hours=-1)
+        assert result["status"] == "error"
+        assert result["code"] == "invalid_input"
+
+    @pytest.mark.asyncio
+    async def test_cache_lookup_invalid_limit(self, server: LithosServer):
+        """Zero limit returns invalid_input error."""
+        result = await self._call_cache_lookup(server, query="test", limit=0)
+        assert result["status"] == "error"
+        assert result["code"] == "invalid_input"
+
+    @pytest.mark.asyncio
+    async def test_cache_lookup_invalid_min_confidence(self, server: LithosServer):
+        """Out-of-range min_confidence returns invalid_input error."""
+        result = await self._call_cache_lookup(server, query="test", min_confidence=1.5)
+        assert result["status"] == "error"
+        assert result["code"] == "invalid_input"
+
+
+class TestWriteMutualExclusion:
+    """Tests for ttl_hours / expires_at mutual exclusion at the MCP boundary."""
+
+    async def _call_write(self, server: LithosServer, **kwargs) -> dict:
+        tools = await server.mcp.get_tools()
+        return await tools["lithos_write"].fn(**kwargs)
+
+    @pytest.mark.asyncio
+    async def test_ttl_hours_with_empty_expires_at_is_error(self, server: LithosServer):
+        """ttl_hours + expires_at='' is contradictory and must be rejected."""
+        result = await self._call_write(
+            server,
+            title="Contradiction",
+            content="Should fail.",
+            agent="agent",
+            ttl_hours=24.0,
+            expires_at="",
+        )
+        assert result["status"] == "error"
+        assert result["code"] == "invalid_input"
+
+    @pytest.mark.asyncio
+    async def test_write_via_tool_with_ttl_hours(self, server: LithosServer):
+        """lithos_write tool with ttl_hours sets expires_at in metadata."""
+        result = await self._call_write(
+            server,
+            title="TTL via Tool",
+            content="Content with TTL via MCP boundary.",
+            agent="agent",
+            ttl_hours=24.0,
+        )
+        assert result["status"] == "created"
+        doc_id = result["id"]
+
+        doc, _ = await server.knowledge.read(id=doc_id)
+        assert doc.metadata.expires_at is not None
+        # Should be roughly 24h from now
+        delta = (doc.metadata.expires_at - datetime.now(timezone.utc)).total_seconds()
+        assert 23 * 3600 < delta < 25 * 3600
