@@ -4,13 +4,12 @@ import asyncio
 import collections
 import concurrent.futures
 import hashlib
+import json
 import logging
 import math
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
-
-import json
 
 from fastmcp import FastMCP
 from starlette.requests import Request
@@ -145,8 +144,12 @@ class LithosServer:
 
         queue = self.event_bus.subscribe(event_types=event_types, tags=tag_filter)
 
+        # Increment before returning the StreamingResponse to avoid a soft race
+        # where concurrent requests all pass the capacity check before any
+        # generator starts and increments the counter.
+        self._sse_client_count += 1
+
         async def _event_stream():
-            self._sse_client_count += 1
             try:
                 # Replay buffered events if a since_id was provided
                 if since_id:
@@ -1652,9 +1655,15 @@ def _format_sse(event: LithosEvent) -> str:
         data: {"agent": "az", "title": "Acme Pricing", ...}
 
     """
+    # Envelope fields (agent, tags, timestamp) always win — strip reserved keys
+    # from the payload copy so they cannot shadow the envelope values.
+    user_data = {**event.payload}
+    user_data.pop("agent", None)
+    user_data.pop("tags", None)
+    user_data.pop("timestamp", None)
     payload = {
         "agent": event.agent,
-        **event.payload,
+        **user_data,
         "tags": event.tags,
         "timestamp": event.timestamp.isoformat(),
     }

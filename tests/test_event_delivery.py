@@ -13,6 +13,7 @@ Coverage:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 from collections.abc import AsyncGenerator
 from pathlib import Path
@@ -21,7 +22,6 @@ import pytest
 import pytest_asyncio
 from starlette.requests import Request
 from starlette.responses import StreamingResponse
-from starlette.testclient import TestClient
 
 from lithos.config import EventsConfig, LithosConfig, StorageConfig
 from lithos.events import (
@@ -34,7 +34,6 @@ from lithos.events import (
     LithosEvent,
 )
 from lithos.server import LithosServer, _format_sse
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -85,13 +84,11 @@ async def _collect_sse_lines(
         # Give the consumer a moment to drain the queue
         await asyncio.sleep(0.1)
 
-    try:
+    with contextlib.suppress(asyncio.TimeoutError):
         await asyncio.wait_for(
             asyncio.gather(_consume(), _emit()),
             timeout=timeout,
         )
-    except asyncio.TimeoutError:
-        pass
 
     return collected
 
