@@ -3061,3 +3061,58 @@ class TestSlugCollision:
                 agent="editor",
                 title="Target Title",
             )
+
+    @pytest.mark.asyncio
+    async def test_create_collision_leaves_no_zombie(
+        self, knowledge_manager: KnowledgeManager, test_config
+    ):
+        """create() must not leave a zombie file or corrupt indices on SlugCollisionError."""
+        from lithos.errors import SlugCollisionError
+
+        await knowledge_manager.create(title="My Document", content="First.", agent="agent")
+
+        kp = test_config.storage.knowledge_path
+        with pytest.raises(SlugCollisionError):
+            await knowledge_manager.create(title="My Document", content="Second.", agent="agent")
+
+        # Collect all .md files that contain "Second." (zombie check)
+        zombie_files = [f for f in kp.rglob("*.md") if "Second." in f.read_text()]
+        assert zombie_files == [], f"Zombie file(s) left on disk: {zombie_files}"
+
+        # The new doc_id must not appear in the indices.
+        # We can verify by checking no path maps to a doc with content "Second."
+        for doc_id, path in knowledge_manager._id_to_path.items():
+            full = kp / path
+            if full.exists() and "Second." in full.read_text():
+                pytest.fail(f"_id_to_path still references zombie doc {doc_id}")
+
+        for path in knowledge_manager._path_to_id:
+            full = kp / path
+            if full.exists() and "Second." in full.read_text():
+                pytest.fail(f"_path_to_id still references zombie path {path}")
+
+    @pytest.mark.asyncio
+    async def test_update_collision_leaves_original_unchanged(
+        self, knowledge_manager: KnowledgeManager, test_config
+    ):
+        """update() must not overwrite the original file on SlugCollisionError."""
+        from lithos.errors import SlugCollisionError
+
+        await knowledge_manager.create(title="Target Title", content="First.", agent="agent")
+        doc2 = (
+            await knowledge_manager.create(title="Other Title", content="Second.", agent="agent")
+        ).document
+        assert doc2 is not None
+
+        kp = test_config.storage.knowledge_path
+        original_text = (kp / doc2.path).read_text()
+
+        with pytest.raises(SlugCollisionError):
+            await knowledge_manager.update(
+                id=doc2.id,
+                agent="editor",
+                title="Target Title",
+            )
+
+        # File on disk must be identical to what it was before the failed update.
+        assert (kp / doc2.path).read_text() == original_text
