@@ -761,6 +761,11 @@ class KnowledgeManager:
                 links=links,
             )
 
+            # Check for slug collision before writing anything
+            existing_slug_id = self._slug_to_id.get(slug)
+            if existing_slug_id is not None and existing_slug_id != doc_id:
+                raise SlugCollisionError(slug, existing_slug_id)
+
             # Write to disk
             full_path.parent.mkdir(parents=True, exist_ok=True)
             _atomic_write(full_path, doc.to_markdown())
@@ -768,9 +773,6 @@ class KnowledgeManager:
             # Update indices
             self._id_to_path[doc_id] = file_path
             self._path_to_id[file_path] = doc_id
-            existing_slug_id = self._slug_to_id.get(slug)
-            if existing_slug_id is not None and existing_slug_id != doc_id:
-                raise SlugCollisionError(slug, existing_slug_id)
             self._slug_to_id[slug] = doc_id
             if norm_url is not None:
                 self._source_url_to_id[norm_url] = doc_id
@@ -1061,18 +1063,20 @@ class KnowledgeManager:
             if agent not in doc.metadata.contributors and agent != doc.metadata.author:
                 doc.metadata.contributors.append(agent)
 
+            # Keep slug index in sync when title changes — check before writing.
+            new_slug = slugify(doc.metadata.title)
+            if new_slug != old_slug:
+                existing_slug_id = self._slug_to_id.get(new_slug)
+                if existing_slug_id is not None and existing_slug_id != id:
+                    raise SlugCollisionError(new_slug, existing_slug_id)
+
             # Write to disk — bump version here so early returns above leave
             # the in-memory document at its original version.
             doc.metadata.version += 1
             _safe_path, full_path = self._resolve_safe_path(doc.path)
             _atomic_write(full_path, doc.to_markdown())
 
-            # Keep slug index in sync when title changes.
-            new_slug = slugify(doc.metadata.title)
             if new_slug != old_slug:
-                existing_slug_id = self._slug_to_id.get(new_slug)
-                if existing_slug_id is not None and existing_slug_id != id:
-                    raise SlugCollisionError(new_slug, existing_slug_id)
                 if self._slug_to_id.get(old_slug) == id:
                     del self._slug_to_id[old_slug]
                 self._slug_to_id[new_slug] = id
