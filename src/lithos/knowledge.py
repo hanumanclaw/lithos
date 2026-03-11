@@ -67,6 +67,7 @@ _KNOWN_METADATA_KEYS = frozenset(
         "supersedes",
         "derived_from_ids",
         "expires_at",
+        "version",
     }
 )
 
@@ -212,6 +213,7 @@ class KnowledgeMetadata:
     derived_from_ids: list[str] = field(default_factory=list)
     expires_at: datetime | None = None
     extra: dict = field(default_factory=dict)
+    version: int = 1
 
     @property
     def is_stale(self) -> bool:
@@ -240,6 +242,7 @@ class KnowledgeMetadata:
             "source": self.source,
             "supersedes": self.supersedes,
         }
+        result["version"] = self.version
         if self.source_url is not None:
             result["source_url"] = self.source_url
         if self.expires_at is not None:
@@ -299,6 +302,7 @@ class KnowledgeMetadata:
             derived_from_ids=data.get("derived_from_ids", []),
             expires_at=expires_at,
             extra=extra,
+            version=int(data.get("version", 1)),
         )
 
 
@@ -866,6 +870,7 @@ class KnowledgeManager:
         source_url: str | None | _UnsetType = _UNSET,
         derived_from_ids: list[str] | None | _UnsetType = _UNSET,
         expires_at: datetime | None | _UnsetType = _UNSET,
+        expected_version: int | None = None,
     ) -> WriteResult:
         """Update an existing document.
 
@@ -887,6 +892,14 @@ class KnowledgeManager:
         async with self._write_lock:
             lithos_metrics.knowledge_ops.add(1, {"op": "update"})
             doc, _ = await self.read(id=id)
+
+            if expected_version is not None and doc.metadata.version != expected_version:
+                return WriteResult(
+                    status="error",
+                    error_code="version_conflict",
+                    message=f"Version conflict: expected {expected_version}, got {doc.metadata.version}",
+                )
+
             old_slug = slugify(doc.metadata.title)
             old_source_url = doc.metadata.source_url
 
@@ -997,6 +1010,7 @@ class KnowledgeManager:
 
             # Update metadata
             doc.metadata.updated_at = datetime.now(timezone.utc)
+            doc.metadata.version = doc.metadata.version + 1
             if agent not in doc.metadata.contributors and agent != doc.metadata.author:
                 doc.metadata.contributors.append(agent)
 
