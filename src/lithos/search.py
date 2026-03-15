@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 import shutil
@@ -21,7 +22,9 @@ from lithos.knowledge import KnowledgeDocument
 from lithos.telemetry import lithos_metrics, traced
 
 if TYPE_CHECKING:
+    import numpy as np
     from chromadb.api import ClientAPI
+    from numpy.typing import NDArray
 
 logger = logging.getLogger(__name__)
 
@@ -485,13 +488,34 @@ class ChromaIndex:
         self._client: ClientAPI | None = None
         self._collection: chromadb.Collection | None = None
         self._model: SentenceTransformer | None = None
+        self._model_lock: asyncio.Lock | None = None
 
     @property
     def model(self) -> SentenceTransformer:
-        """Get embedding model, loading if needed."""
+        """Get embedding model, loading if needed (synchronous, for backward compatibility)."""
         if self._model is None:
             self._model = SentenceTransformer(self.model_name)
         return self._model
+
+    async def ensure_model_loaded(self) -> None:
+        """Ensure the embedding model is loaded, using a thread pool to avoid blocking."""
+        # Lazily create the lock (safe: asyncio is single-threaded)
+        if self._model_lock is None:
+            self._model_lock = asyncio.Lock()
+        async with self._model_lock:
+            if self._model is None:
+                self._model = await asyncio.to_thread(SentenceTransformer, self.model_name)
+
+    async def embed_async(self, texts: list[str]) -> NDArray[np.float32]:
+        """Generate embeddings asynchronously without blocking the event loop.
+
+        NOTE: This method is currently unused (dead code).  It is kept here as
+        preparatory work for a follow-up PR that will migrate the search layer to
+        fully async embedding generation.  Remove this note once the follow-up
+        lands, or remove the method if the approach changes.
+        """
+        await self.ensure_model_loaded()
+        return await asyncio.to_thread(self.model.encode, texts)
 
     @property
     def client(self) -> ClientAPI:
@@ -733,6 +757,10 @@ class SearchEngine:
                 self.config.search.embedding_model,
             )
         return self._chroma
+
+    async def ensure_embeddings_loaded(self) -> None:
+        """Pre-warm the embedding model asynchronously."""
+        await self.chroma.ensure_model_loaded()
 
     @traced("lithos.search.index_document")
     def index_document(self, doc: KnowledgeDocument) -> int:

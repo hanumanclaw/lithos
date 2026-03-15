@@ -63,6 +63,9 @@ class LithosServer:
         # Cached active claims count for the OTEL observable gauge callback
         self._cached_active_claims: int = 0
 
+        # Background tasks (kept to prevent garbage collection)
+        self._background_tasks: set[asyncio.Task[None]] = set()
+
         # File watcher
         self._observer: Observer | None = None  # type: ignore[reportInvalidTypeForm]
         self._watch_loop: asyncio.AbstractEventLoop | None = None
@@ -220,6 +223,21 @@ class LithosServer:
             # Try to load cached graph
             if not self.graph.load_cache():
                 await self._rebuild_indices()
+
+        # Pre-warm the embedding model in the background so the first real
+        # request does not block the event loop.  Skip if the rebuild path
+        # already loaded it synchronously.
+        if self.search.chroma._model is None:
+            task = asyncio.create_task(self._prewarm_embeddings())
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_tasks.discard)
+
+    async def _prewarm_embeddings(self) -> None:
+        """Pre-warm the embedding model, logging errors instead of crashing."""
+        try:
+            await self.search.ensure_embeddings_loaded()
+        except Exception:
+            logger.warning("Background embedding model pre-warm failed", exc_info=True)
 
     async def _rebuild_indices(self) -> None:
         """Rebuild all search indices from files."""
