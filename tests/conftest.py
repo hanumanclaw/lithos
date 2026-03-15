@@ -15,6 +15,15 @@ from lithos.knowledge import KnowledgeManager
 from lithos.search import SearchEngine
 from lithos.server import LithosServer
 
+# Env vars that the LithosConfig model_validator reads.
+_LITHOS_ENV_VARS = (
+    "LITHOS_DATA_DIR",
+    "LITHOS_PORT",
+    "LITHOS_HOST",
+    "LITHOS_OTEL_ENABLED",
+    "OTEL_EXPORTER_OTLP_ENDPOINT",
+)
+
 
 @pytest.fixture
 def temp_dir() -> Generator[Path, None, None]:
@@ -25,8 +34,16 @@ def temp_dir() -> Generator[Path, None, None]:
 
 
 @pytest.fixture
-def test_config(temp_dir: Path) -> Generator[LithosConfig, None, None]:
-    """Create test configuration with temporary directories."""
+def test_config(
+    temp_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> Generator[LithosConfig, None, None]:
+    """Create test configuration with temporary directories.
+
+    Clears all LITHOS_* env vars that the model_validator would read, so
+    constructor arguments are always respected.
+    """
+    for var in _LITHOS_ENV_VARS:
+        monkeypatch.delenv(var, raising=False)
     config = LithosConfig(
         storage=StorageConfig(data_dir=temp_dir),
     )

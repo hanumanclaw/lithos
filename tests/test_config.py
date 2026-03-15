@@ -4,6 +4,7 @@ import os
 import tempfile
 from pathlib import Path
 
+import pytest
 import yaml
 
 from lithos.config import (
@@ -174,6 +175,60 @@ class TestConfigEnvironment:
         config = load_config()
 
         assert config.server.host == "127.0.0.1"
+
+    def test_env_otel_enabled_numeric(self, monkeypatch):
+        """LITHOS_OTEL_ENABLED=1 maps to telemetry.enabled=True."""
+        monkeypatch.setenv("LITHOS_OTEL_ENABLED", "1")
+
+        config = load_config()
+
+        assert config.telemetry.enabled is True
+
+    def test_env_otel_enabled_string(self, monkeypatch):
+        """LITHOS_OTEL_ENABLED=true maps to telemetry.enabled=True."""
+        monkeypatch.setenv("LITHOS_OTEL_ENABLED", "true")
+
+        config = load_config()
+
+        assert config.telemetry.enabled is True
+
+    def test_env_otel_enabled_false(self, monkeypatch):
+        """LITHOS_OTEL_ENABLED=false keeps telemetry.enabled=False."""
+        monkeypatch.setenv("LITHOS_OTEL_ENABLED", "false")
+
+        config = load_config()
+
+        assert config.telemetry.enabled is False
+
+    def test_env_otlp_endpoint(self, monkeypatch):
+        """OTEL_EXPORTER_OTLP_ENDPOINT maps to telemetry.endpoint."""
+        monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318")
+
+        config = load_config()
+
+        assert config.telemetry.endpoint == "http://otel-collector:4318"
+
+    def test_env_port_invalid_raises(self, monkeypatch):
+        """LITHOS_PORT with a non-integer value raises a clear error."""
+        monkeypatch.setenv("LITHOS_PORT", "abc")
+
+        with pytest.raises(ValueError, match="LITHOS_PORT must be a valid integer"):
+            load_config()
+
+    def test_explicit_constructor_arg_not_overridden_by_env(self, monkeypatch):
+        """Constructor args take precedence over env vars."""
+        monkeypatch.setenv("LITHOS_DATA_DIR", "/env/data")
+        monkeypatch.setenv("LITHOS_PORT", "9999")
+        monkeypatch.setenv("LITHOS_HOST", "1.2.3.4")
+
+        config = LithosConfig(
+            storage=StorageConfig(data_dir=Path("/explicit/path")),
+            server=ServerConfig(port=1111, host="10.0.0.1"),
+        )
+
+        assert config.storage.data_dir == Path("/explicit/path")
+        assert config.server.port == 1111
+        assert config.server.host == "10.0.0.1"
 
 
 class TestConfigSingleton:
