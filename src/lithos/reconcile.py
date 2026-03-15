@@ -212,7 +212,14 @@ async def _reconcile_indices(config: LithosConfig, dry_run: bool) -> dict[str, A
 
 
 async def _reconcile_graph(config: LithosConfig, dry_run: bool) -> dict[str, Any]:
-    """Reconcile the wiki-link graph cache against the markdown corpus."""
+    """Reconcile the wiki-link graph cache against the markdown corpus.
+
+    When the cache is already consistent (no node/edge drift), a second pass
+    scans for stale wiki-links (targets that don't resolve to any document)
+    and reports them as ``stale_link`` actions.  Stale-link detection is
+    skipped when the cache itself needs a rebuild; the caller must reconcile
+    again after repair to surface stale links.
+    """
     tracer = get_tracer()
     actions: list[dict[str, Any]] = []
     failures: list[dict[str, Any]] = []
