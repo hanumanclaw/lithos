@@ -953,6 +953,9 @@ class LithosServer:
                 best_hit = None
                 first_stale_id: str | None = None
                 now = datetime.now(timezone.utc)
+                # passing_docs is populated only when sort_by_confidence is True,
+                # but it is declared here unconditionally to keep the type checker
+                # happy and avoid a conditional assignment before the append below.
                 passing_docs: list[Any] = []
 
                 for doc_id in candidates:
