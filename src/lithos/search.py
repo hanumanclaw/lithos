@@ -505,7 +505,13 @@ class ChromaIndex:
                 self._model = await asyncio.to_thread(SentenceTransformer, self.model_name)
 
     async def embed_async(self, texts: list[str]) -> Any:
-        """Generate embeddings asynchronously without blocking the event loop."""
+        """Generate embeddings asynchronously without blocking the event loop.
+
+        NOTE: This method is currently unused (dead code).  It is kept here as
+        preparatory work for a follow-up PR that will migrate the search layer to
+        fully async embedding generation.  Remove this note once the follow-up
+        lands, or remove the method if the approach changes.
+        """
         await self.ensure_model_loaded()
         return await asyncio.to_thread(self.model.encode, texts)
 

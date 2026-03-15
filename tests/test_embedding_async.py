@@ -12,8 +12,8 @@ from lithos.search import ChromaIndex
 
 
 @pytest.mark.asyncio
-async def test_ensure_model_loaded_is_nonblocking(tmp_path):
-    """ensure_model_loaded() is idempotent and only loads the model once under concurrency."""
+async def test_ensure_model_loaded_only_loads_once(tmp_path):
+    """ensure_model_loaded() is idempotent — concurrent callers share a single load."""
     load_count = 0
 
     def slow_constructor(model_name):
