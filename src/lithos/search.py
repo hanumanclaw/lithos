@@ -518,8 +518,8 @@ class ChromaIndex:
         return await asyncio.to_thread(self.model.encode, texts)
 
     def health_check(self) -> None:
-        """Probe the embedding model. Raises on failure."""
-        self.model.encode(["health check"])
+        """Probe the embedding model (warm-up / liveness). Raises on failure."""
+        self.model.encode(["health check"])  # result discarded; exercises model load
 
     @property
     def client(self) -> ClientAPI:

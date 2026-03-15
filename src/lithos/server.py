@@ -1727,7 +1727,7 @@ class LithosServer:
             components: dict[str, Any] = {}
 
             try:
-                self.knowledge.knowledge_path.stat()
+                self.knowledge.knowledge_path.exists()
                 components["kb_directory"] = {"status": "ok"}
             except Exception as e:
                 components["kb_directory"] = {"status": "unavailable", "error": str(e)}
