@@ -1821,7 +1821,7 @@ class TestHealthEndpoint:
     @pytest.mark.asyncio
     async def test_http_health_200_when_ok(self, server: LithosServer):
         """HTTP /health returns 200 when all components are healthy."""
-        from unittest.mock import AsyncMock, MagicMock
+        from unittest.mock import MagicMock
 
         request = MagicMock()
         response = await server._health_endpoint(request)
