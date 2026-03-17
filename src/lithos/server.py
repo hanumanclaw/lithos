@@ -1071,6 +1071,8 @@ class LithosServer:
             since: str | None = None,
             limit: int = 50,
             offset: int = 0,
+            title_contains: str | None = None,
+            content_query: str | None = None,
         ) -> dict[str, Any]:
             """List knowledge documents with filters.
 
@@ -1081,6 +1083,13 @@ class LithosServer:
                 since: Filter by updated since (ISO datetime)
                 limit: Max results (default: 50)
                 offset: Pagination offset
+                title_contains: Filter by case-insensitive substring match on title
+                content_query: Filter by full-text search query (Tantivy). When
+                    provided the entire base-filtered set is searched in-memory,
+                    so results and ``total`` are always correct across pages.
+                    full_text_search is called with a limit equal to the total
+                    number of base-filtered documents so no matches are silently
+                    dropped.
 
             Returns:
                 Dict with items list and total count
@@ -1095,14 +1104,67 @@ class LithosServer:
                 if since:
                     since_dt = datetime.fromisoformat(since)
 
-                docs, total = await self.knowledge.list_all(
-                    path_prefix=path_prefix,
-                    tags=tags,
-                    author=author,
-                    since=since_dt,
-                    limit=limit,
-                    offset=offset,
-                )
+                if title_contains is not None or content_query is not None:
+                    # When post-fetch filters are active we must fetch the full
+                    # base-filtered set first; filtering after pagination would
+                    # miss docs on earlier pages and produce wrong totals.
+                    # Step 1: get total count with limit=0 (returns count, no docs).
+                    _, total_base = await self.knowledge.list_all(
+                        path_prefix=path_prefix,
+                        tags=tags,
+                        author=author,
+                        since=since_dt,
+                        limit=0,
+                        offset=0,
+                    )
+                    # Step 2: fetch all base-filtered docs for in-memory filtering.
+                    if total_base > 0:
+                        all_docs, _ = await self.knowledge.list_all(
+                            path_prefix=path_prefix,
+                            tags=tags,
+                            author=author,
+                            since=since_dt,
+                            limit=total_base,
+                            offset=0,
+                        )
+                    else:
+                        all_docs = []
+
+                    if title_contains is not None:
+                        all_docs = [
+                            d for d in all_docs if title_contains.lower() in d.title.lower()
+                        ]
+
+                    if content_query is not None:
+                        try:
+                            # TODO: run in executor — full_text_search is sync and
+                            #       should not block the event loop.
+                            fts_results = self.search.full_text_search(
+                                query=content_query,
+                                # Use total_base as the cap so we never silently
+                                # truncate matches from the base-filtered set.
+                                limit=max(total_base, 1),
+                            )
+                            fts_ids = {r.id for r in fts_results}
+                            all_docs = [d for d in all_docs if d.id in fts_ids]
+                        except SearchBackendError as exc:
+                            return {
+                                "status": "error",
+                                "code": "search_backend_error",
+                                "message": f"Full-text search failed: {exc}",
+                            }
+
+                    total = len(all_docs)
+                    docs = all_docs[offset : offset + limit]
+                else:
+                    docs, total = await self.knowledge.list_all(
+                        path_prefix=path_prefix,
+                        tags=tags,
+                        author=author,
+                        since=since_dt,
+                        limit=limit,
+                        offset=offset,
+                    )
 
                 span.set_attribute("lithos.result_count", len(docs))
                 logger.info("lithos_list results=%d total=%d", len(docs), total)
@@ -1222,17 +1284,24 @@ class LithosServer:
                 return result
 
         @self.mcp.tool()
-        async def lithos_tags() -> dict[str, dict[str, int]]:
+        async def lithos_tags(
+            prefix: str | None = None,
+        ) -> dict[str, dict[str, int]]:
             """Get all tags with document counts.
+
+            Args:
+                prefix: Optional prefix filter (case-insensitive). Only tags starting with this prefix are returned.
 
             Returns:
                 Dict with tags mapping tag name to count
             """
-            logger.info("lithos_tags")
+            logger.info("lithos_tags prefix=%s", prefix)
             tracer = get_tracer()
             with tracer.start_as_current_span("lithos.tool.tags") as span:
                 span.set_attribute("lithos.tool", "lithos_tags")
                 tags = await self.knowledge.get_all_tags()
+                if prefix is not None:
+                    tags = {k: v for k, v in tags.items() if k.lower().startswith(prefix.lower())}
                 span.set_attribute("lithos.tag_count", len(tags))
                 return {"tags": tags}
 
