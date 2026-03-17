@@ -861,6 +861,12 @@ class LithosServer:
                 span.set_attribute("lithos.limit", limit)
                 span.set_attribute("lithos.mode", mode)
 
+                valid_modes = {"hybrid", "fulltext", "semantic"}
+                if mode not in valid_modes:
+                    raise ValueError(
+                        f"Unknown search mode {mode!r}. Valid values: hybrid, fulltext, semantic."
+                    )
+
                 if mode == "fulltext":
                     ft_results = self.search.full_text_search(
                         query=query,
@@ -931,7 +937,6 @@ class LithosServer:
 
                 span.set_attribute("lithos.result_count", len(results_payload))
                 logger.info("lithos_search mode=%s results=%d", mode, len(results_payload))
-                lithos_metrics.search_ops.add(1, {"type": mode})
                 return {"results": results_payload}
 
         @self.mcp.tool()

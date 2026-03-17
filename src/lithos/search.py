@@ -959,6 +959,8 @@ class SearchEngine:
         try:
             ft_results: list[SearchResult] = []
             sem_results: list[SemanticResult] = []
+            ft_failed = False
+            sem_failed = False
 
             try:
                 ft_results = self.tantivy.search(
@@ -970,6 +972,7 @@ class SearchEngine:
                 )
             except Exception as exc:
                 logger.warning("Hybrid search: full-text backend failed: %s", exc)
+                ft_failed = True
 
             try:
                 sem_results = self.chroma.search(
@@ -982,8 +985,9 @@ class SearchEngine:
                 )
             except Exception as exc:
                 logger.warning("Hybrid search: semantic backend failed: %s", exc)
+                sem_failed = True
 
-            if not ft_results and not sem_results:
+            if ft_failed and sem_failed:
                 raise SearchBackendError(
                     "All backends failed during hybrid search",
                     {},
