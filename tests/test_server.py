@@ -405,6 +405,73 @@ class TestKnowledgeToolWorkflow:
         assert result["items"][0]["id"] == doc_a.id
 
     @pytest.mark.asyncio
+    async def test_lithos_list_title_contains_pagination(self, server: LithosServer):
+        """total reflects true match count across pages, not just the current page."""
+        tool = await server.mcp.get_tool("lithos_list")
+
+        # Create 12 docs whose titles contain "Widget" and 3 that don't.
+        widget_ids = []
+        for i in range(12):
+            doc = (
+                await server.knowledge.create(
+                    title=f"Widget Item {i:02d}",
+                    content=f"Widget content {i}.",
+                    agent="agent",
+                )
+            ).document
+            widget_ids.append(doc.id)
+        for i in range(3):
+            await server.knowledge.create(
+                title=f"Other Item {i:02d}",
+                content=f"Other content {i}.",
+                agent="agent",
+            )
+
+        # Page 1: limit=5, offset=0 — should see 5 items but total=12
+        page1 = await tool.fn(title_contains="widget", limit=5, offset=0)
+        assert page1["total"] == 12, (
+            f"total should be 12 (full match count), got {page1['total']}"
+        )
+        assert len(page1["items"]) == 5
+
+        # Page 2: limit=5, offset=5 — next 5 items, total still 12
+        page2 = await tool.fn(title_contains="widget", limit=5, offset=5)
+        assert page2["total"] == 12
+        assert len(page2["items"]) == 5
+
+        # Page 3: limit=5, offset=10 — last 2 items, total still 12
+        page3 = await tool.fn(title_contains="widget", limit=5, offset=10)
+        assert page3["total"] == 12
+        assert len(page3["items"]) == 2
+
+        # All returned IDs should be Widget docs only
+        all_returned_ids = (
+            {i["id"] for i in page1["items"]}
+            | {i["id"] for i in page2["items"]}
+            | {i["id"] for i in page3["items"]}
+        )
+        assert all_returned_ids == set(widget_ids)
+
+    @pytest.mark.asyncio
+    async def test_lithos_list_content_query_search_backend_error(self, server: LithosServer):
+        """content_query returns error envelope when full_text_search raises SearchBackendError."""
+        from lithos.errors import SearchBackendError
+
+        await server.knowledge.create(
+            title="Some Doc",
+            content="Some content.",
+            agent="agent",
+        )
+        tool = await server.mcp.get_tool("lithos_list")
+        err = SearchBackendError("index crashed", {"tantivy": RuntimeError("segment fault")})
+        with patch.object(server.search, "full_text_search", side_effect=err):
+            result = await tool.fn(content_query="anything")
+
+        assert result["status"] == "error"
+        assert result["code"] == "search_backend_error"
+        assert "index crashed" in result["message"]
+
+    @pytest.mark.asyncio
     async def test_lithos_read_missing_id_returns_structured_error(self, server: LithosServer):
         """lithos_read returns a structured error envelope for a non-existent document (fixes #102)."""
         tool = await server.mcp.get_tool("lithos_read")
