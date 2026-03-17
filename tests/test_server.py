@@ -1337,6 +1337,146 @@ class TestCacheLookup:
         assert result["code"] == "invalid_input"
 
 
+class TestErrorEnvelopes:
+    """Tests for issue #85: consistent error envelopes across all tools."""
+
+    async def _call(self, server: LithosServer, tool_name: str, **kwargs) -> dict:
+        tool = await server.mcp.get_tool(tool_name)
+        return await tool.fn(**kwargs)
+
+    # --- lithos_delete ---
+
+    @pytest.mark.asyncio
+    async def test_delete_missing_doc_returns_error_envelope(self, server: LithosServer):
+        """lithos_delete returns error envelope when document does not exist (fixes #85)."""
+        result = await self._call(
+            server,
+            "lithos_delete",
+            id="00000000-0000-0000-0000-000000000000",
+        )
+        assert result["status"] == "error"
+        assert result["code"] == "doc_not_found"
+        assert "00000000-0000-0000-0000-000000000000" in result["message"]
+
+    @pytest.mark.asyncio
+    async def test_delete_existing_doc_returns_success(self, server: LithosServer):
+        """lithos_delete still returns success=True for an existing document."""
+        doc = (
+            await server.knowledge.create(
+                title="Delete Me",
+                content="Temporary.",
+                agent="agent",
+            )
+        ).document
+        assert doc is not None
+        result = await self._call(server, "lithos_delete", id=doc.id)
+        assert result == {"success": True}
+
+    # --- lithos_task_claim ---
+
+    @pytest.mark.asyncio
+    async def test_task_claim_nonexistent_task_returns_error_envelope(self, server: LithosServer):
+        """lithos_task_claim returns error envelope for a non-existent task (fixes #85)."""
+        result = await self._call(
+            server,
+            "lithos_task_claim",
+            task_id="00000000-0000-0000-0000-000000000000",
+            aspect="research",
+            agent="agent",
+        )
+        assert result["status"] == "error"
+        assert result["code"] == "claim_failed"
+        assert "message" in result
+
+    @pytest.mark.asyncio
+    async def test_task_claim_conflict_returns_error_envelope(self, server: LithosServer):
+        """lithos_task_claim returns error envelope when aspect is already held (fixes #85)."""
+        task_id = await server.coordination.create_task(title="Contested", agent="creator")
+        # First agent claims successfully
+        first = await self._call(
+            server,
+            "lithos_task_claim",
+            task_id=task_id,
+            aspect="work",
+            agent="agent-1",
+        )
+        assert first["success"] is True
+
+        # Second agent should get an error envelope, not success=False
+        second = await self._call(
+            server,
+            "lithos_task_claim",
+            task_id=task_id,
+            aspect="work",
+            agent="agent-2",
+        )
+        assert second["status"] == "error"
+        assert second["code"] == "claim_failed"
+
+    # --- lithos_task_renew ---
+
+    @pytest.mark.asyncio
+    async def test_task_renew_nonexistent_claim_returns_error_envelope(self, server: LithosServer):
+        """lithos_task_renew returns error envelope when no active claim exists (fixes #85)."""
+        result = await self._call(
+            server,
+            "lithos_task_renew",
+            task_id="00000000-0000-0000-0000-000000000000",
+            aspect="research",
+            agent="nobody",
+        )
+        assert result["status"] == "error"
+        assert result["code"] == "claim_not_found"
+        assert "message" in result
+
+    # --- lithos_task_release ---
+
+    @pytest.mark.asyncio
+    async def test_task_release_nonexistent_claim_returns_error_envelope(
+        self, server: LithosServer
+    ):
+        """lithos_task_release returns error envelope when no matching claim exists (fixes #85)."""
+        result = await self._call(
+            server,
+            "lithos_task_release",
+            task_id="00000000-0000-0000-0000-000000000000",
+            aspect="research",
+            agent="nobody",
+        )
+        assert result["status"] == "error"
+        assert result["code"] == "claim_not_found"
+        assert "message" in result
+
+    # --- lithos_task_complete ---
+
+    @pytest.mark.asyncio
+    async def test_task_complete_nonexistent_task_returns_error_envelope(
+        self, server: LithosServer
+    ):
+        """lithos_task_complete returns error envelope for a non-existent task (fixes #85)."""
+        result = await self._call(
+            server,
+            "lithos_task_complete",
+            task_id="00000000-0000-0000-0000-000000000000",
+            agent="agent",
+        )
+        assert result["status"] == "error"
+        assert result["code"] == "task_not_found"
+        assert "message" in result
+
+    @pytest.mark.asyncio
+    async def test_task_complete_already_completed_returns_error_envelope(
+        self, server: LithosServer
+    ):
+        """lithos_task_complete returns error envelope for an already-completed task (fixes #85)."""
+        task_id = await server.coordination.create_task(title="Done Task", agent="agent")
+        await server.coordination.complete_task(task_id, "agent")
+
+        result = await self._call(server, "lithos_task_complete", task_id=task_id, agent="agent")
+        assert result["status"] == "error"
+        assert result["code"] == "task_not_found"
+
+
 class TestWriteMutualExclusion:
     """Tests for ttl_hours / expires_at mutual exclusion at the MCP boundary."""
 
