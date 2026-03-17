@@ -724,7 +724,7 @@ class LithosServer:
         async def lithos_delete(
             id: str,
             agent: str | None = None,
-        ) -> dict[str, bool]:
+        ) -> dict[str, Any]:
             """Delete a knowledge file.
 
             Args:
@@ -732,7 +732,7 @@ class LithosServer:
                 agent: Agent performing deletion (for audit trail)
 
             Returns:
-                Dict with success boolean
+                Dict with success boolean, or error envelope if document not found
             """
             logger.info("lithos_delete id=%s agent=%s", id, agent)
             tracer = get_tracer()
@@ -745,20 +745,26 @@ class LithosServer:
 
                 success, path = await self.knowledge.delete(id)
 
-                if success:
-                    self.search.remove_document(id)
-                    self.graph.remove_document(id)
-                    self.graph.save_cache()
+                if not success:
+                    return {
+                        "status": "error",
+                        "code": "doc_not_found",
+                        "message": f"Document not found: {id}",
+                    }
 
-                    await self._emit(
-                        LithosEvent(
-                            type=NOTE_DELETED,
-                            agent=agent or "",
-                            payload={"id": id, "path": path},
-                        )
+                self.search.remove_document(id)
+                self.graph.remove_document(id)
+                self.graph.save_cache()
+
+                await self._emit(
+                    LithosEvent(
+                        type=NOTE_DELETED,
+                        agent=agent or "",
+                        payload={"id": id, "path": path},
                     )
+                )
 
-                return {"success": success}
+                return {"success": True}
 
         @self.mcp.tool()
         async def lithos_search(
@@ -1492,18 +1498,27 @@ class LithosServer:
                 )
                 span.set_attribute("lithos.success", success)
 
-                if success:
-                    await self._emit(
-                        LithosEvent(
-                            type=TASK_CLAIMED,
-                            agent=agent,
-                            payload={"task_id": task_id, "agent": agent, "aspect": aspect},
-                        )
+                if not success:
+                    return {
+                        "status": "error",
+                        "code": "claim_failed",
+                        "message": (
+                            f"Could not claim aspect '{aspect}' on task '{task_id}': "
+                            "task not found, not open, or aspect already claimed by another agent."
+                        ),
+                    }
+
+                await self._emit(
+                    LithosEvent(
+                        type=TASK_CLAIMED,
+                        agent=agent,
+                        payload={"task_id": task_id, "agent": agent, "aspect": aspect},
                     )
+                )
 
                 return {
-                    "success": success,
-                    "expires_at": expires_at.isoformat() if expires_at else None,
+                    "success": True,
+                    "expires_at": expires_at.isoformat(),  # type: ignore[union-attr]
                 }
 
         @self.mcp.tool()
@@ -1538,9 +1553,20 @@ class LithosServer:
                     ttl_minutes=ttl_minutes,
                 )
                 span.set_attribute("lithos.success", success)
+
+                if not success:
+                    return {
+                        "status": "error",
+                        "code": "claim_not_found",
+                        "message": (
+                            f"No active claim found for task '{task_id}', "
+                            f"aspect '{aspect}', agent '{agent}'."
+                        ),
+                    }
+
                 return {
-                    "success": success,
-                    "new_expires_at": (new_expires.isoformat() if new_expires else None),
+                    "success": True,
+                    "new_expires_at": new_expires.isoformat(),  # type: ignore[union-attr]
                 }
 
         @self.mcp.tool()
@@ -1548,7 +1574,7 @@ class LithosServer:
             task_id: str,
             aspect: str,
             agent: str,
-        ) -> dict[str, bool]:
+        ) -> dict[str, Any]:
             """Release a claim.
 
             Args:
@@ -1557,7 +1583,7 @@ class LithosServer:
                 agent: Agent releasing the claim
 
             Returns:
-                Dict with success boolean
+                Dict with success boolean, or error envelope if no matching claim
             """
             logger.info("lithos_task_release task=%s aspect=%s agent=%s", task_id, aspect, agent)
             tracer = get_tracer()
@@ -1573,22 +1599,31 @@ class LithosServer:
                 )
                 span.set_attribute("lithos.success", success)
 
-                if success:
-                    await self._emit(
-                        LithosEvent(
-                            type=TASK_RELEASED,
-                            agent=agent,
-                            payload={"task_id": task_id, "agent": agent, "aspect": aspect},
-                        )
-                    )
+                if not success:
+                    return {
+                        "status": "error",
+                        "code": "claim_not_found",
+                        "message": (
+                            f"No matching claim found for task '{task_id}', "
+                            f"aspect '{aspect}', agent '{agent}'."
+                        ),
+                    }
 
-                return {"success": success}
+                await self._emit(
+                    LithosEvent(
+                        type=TASK_RELEASED,
+                        agent=agent,
+                        payload={"task_id": task_id, "agent": agent, "aspect": aspect},
+                    )
+                )
+
+                return {"success": True}
 
         @self.mcp.tool()
         async def lithos_task_complete(
             task_id: str,
             agent: str,
-        ) -> dict[str, bool]:
+        ) -> dict[str, Any]:
             """Mark a task as completed.
 
             Args:
@@ -1596,7 +1631,7 @@ class LithosServer:
                 agent: Agent completing the task
 
             Returns:
-                Dict with success boolean
+                Dict with success boolean, or error envelope if task not found or not open
             """
             logger.info("lithos_task_complete task=%s agent=%s", task_id, agent)
             tracer = get_tracer()
@@ -1610,16 +1645,22 @@ class LithosServer:
                 )
                 span.set_attribute("lithos.success", success)
 
-                if success:
-                    await self._emit(
-                        LithosEvent(
-                            type=TASK_COMPLETED,
-                            agent=agent,
-                            payload={"task_id": task_id, "agent": agent},
-                        )
-                    )
+                if not success:
+                    return {
+                        "status": "error",
+                        "code": "task_not_found",
+                        "message": f"Task '{task_id}' not found or not in an open state.",
+                    }
 
-                return {"success": success}
+                await self._emit(
+                    LithosEvent(
+                        type=TASK_COMPLETED,
+                        agent=agent,
+                        payload={"task_id": task_id, "agent": agent},
+                    )
+                )
+
+                return {"success": True}
 
         @self.mcp.tool()
         async def lithos_task_cancel(

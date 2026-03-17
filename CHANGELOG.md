@@ -15,6 +15,32 @@ error envelope:
 { "status": "error", "code": "doc_not_found", "message": "..." }
 ```
 
+### Fix: Consistent error envelopes across all tools (issue #85)
+
+Error handling was inconsistent across tool categories:
+
+- Coordination tools (`lithos_task_claim`, `lithos_task_renew`,
+  `lithos_task_release`, `lithos_task_complete`) returned `{ success: false }`
+  on failure.
+- `lithos_delete` returned `{ success: false }` when the document was not found.
+
+All failure paths now return a standard error envelope:
+
+```json
+{ "status": "error", "code": "...", "message": "..." }
+```
+
+| Tool | Error code |
+|------|-----------|
+| `lithos_delete` (not found) | `doc_not_found` |
+| `lithos_task_claim` (task missing/closed/conflict) | `claim_failed` |
+| `lithos_task_renew` (no active claim) | `claim_not_found` |
+| `lithos_task_release` (no matching claim) | `claim_not_found` |
+| `lithos_task_complete` (task missing/not open) | `task_not_found` |
+
+**Breaking:** callers that checked `result.get("success") == False` on
+coordination tools must be updated to check `result.get("status") == "error"`.
+Success paths are unchanged.
 ### Schema change — `version` field in frontmatter (issue #45)
 
 PR #55 adds optimistic locking via a `version` integer field in the YAML
