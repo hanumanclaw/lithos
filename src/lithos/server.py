@@ -841,8 +841,8 @@ class LithosServer:
                 limit: Max results (default: 10)
                 mode: Search mode — "hybrid" | "fulltext" | "semantic" (default: "hybrid")
                 tags: Filter by tags (AND)
-                author: Filter by author (fulltext/hybrid only)
-                path_prefix: Filter by path prefix (fulltext/hybrid only)
+                author: Filter by author (all modes)
+                path_prefix: Filter by path prefix (all modes)
                 threshold: Minimum similarity 0-1 for semantic/hybrid (default: 0.5)
 
             Returns:
@@ -895,6 +895,8 @@ class LithosServer:
                         limit=limit,
                         threshold=threshold,
                         tags=tags,
+                        author=author,
+                        path_prefix=path_prefix,
                     )
                     results_payload = [
                         {

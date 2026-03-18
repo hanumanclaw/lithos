@@ -452,6 +452,199 @@ class TestSearchEngineIntegration:
         assert stats["chunks"] >= 1
 
 
+class TestChromaIndexFilters:
+    """Tests for author and path_prefix filters on ChromaIndex.search()."""
+
+    @pytest.mark.asyncio
+    async def test_author_filter_includes_matching(
+        self, knowledge_manager: KnowledgeManager, search_engine: SearchEngine
+    ):
+        """ChromaIndex.search() returns only docs by the specified author."""
+        alice_doc = (
+            await knowledge_manager.create(
+                title="Alice's Research",
+                content="Deep learning architectures and transformer models.",
+                agent="alice",
+            )
+        ).document
+        bob_doc = (
+            await knowledge_manager.create(
+                title="Bob's Research",
+                content="Deep learning architectures and transformer models.",
+                agent="bob",
+            )
+        ).document
+        search_engine.index_document(alice_doc)
+        search_engine.index_document(bob_doc)
+
+        results = search_engine.chroma.search(
+            "deep learning transformers", limit=10, threshold=0.0, author="alice"
+        )
+        result_ids = [r.id for r in results]
+
+        assert alice_doc.id in result_ids
+        assert bob_doc.id not in result_ids
+
+    @pytest.mark.asyncio
+    async def test_author_filter_excludes_all_when_no_match(
+        self, knowledge_manager: KnowledgeManager, search_engine: SearchEngine
+    ):
+        """ChromaIndex.search() returns empty list when author filter matches nobody."""
+        doc = (
+            await knowledge_manager.create(
+                title="Some Research",
+                content="Machine learning and neural networks.",
+                agent="charlie",
+            )
+        ).document
+        search_engine.index_document(doc)
+
+        results = search_engine.chroma.search(
+            "machine learning", limit=10, threshold=0.0, author="nobody"
+        )
+        assert results == []
+
+    @pytest.mark.asyncio
+    async def test_path_prefix_filter_includes_matching(
+        self, knowledge_manager: KnowledgeManager, search_engine: SearchEngine
+    ):
+        """ChromaIndex.search() returns only docs under the given path prefix."""
+        procedures_doc = (
+            await knowledge_manager.create(
+                title="Deployment Procedure",
+                content="Steps for deploying microservices to production.",
+                agent="agent",
+                path="procedures",
+            )
+        ).document
+        notes_doc = (
+            await knowledge_manager.create(
+                title="Deployment Notes",
+                content="Steps for deploying microservices to production.",
+                agent="agent",
+                path="notes",
+            )
+        ).document
+        search_engine.index_document(procedures_doc)
+        search_engine.index_document(notes_doc)
+
+        results = search_engine.chroma.search(
+            "deploying microservices", limit=10, threshold=0.0, path_prefix="procedures"
+        )
+        result_ids = [r.id for r in results]
+
+        assert procedures_doc.id in result_ids
+        assert notes_doc.id not in result_ids
+
+    @pytest.mark.asyncio
+    async def test_author_and_path_prefix_combined(
+        self, knowledge_manager: KnowledgeManager, search_engine: SearchEngine
+    ):
+        """ChromaIndex.search() applies author and path_prefix as AND filters."""
+        match_doc = (
+            await knowledge_manager.create(
+                title="Alice Procedures Doc",
+                content="Database optimisation and indexing strategies.",
+                agent="alice",
+                path="procedures",
+            )
+        ).document
+        wrong_author_doc = (
+            await knowledge_manager.create(
+                title="Bob Procedures Doc",
+                content="Database optimisation and indexing strategies.",
+                agent="bob",
+                path="procedures",
+            )
+        ).document
+        wrong_path_doc = (
+            await knowledge_manager.create(
+                title="Alice Notes Doc",
+                content="Database optimisation and indexing strategies.",
+                agent="alice",
+                path="notes",
+            )
+        ).document
+        search_engine.index_document(match_doc)
+        search_engine.index_document(wrong_author_doc)
+        search_engine.index_document(wrong_path_doc)
+
+        results = search_engine.chroma.search(
+            "database indexing",
+            limit=10,
+            threshold=0.0,
+            author="alice",
+            path_prefix="procedures",
+        )
+        result_ids = [r.id for r in results]
+
+        assert match_doc.id in result_ids
+        assert wrong_author_doc.id not in result_ids
+        assert wrong_path_doc.id not in result_ids
+
+    @pytest.mark.asyncio
+    async def test_semantic_search_engine_wires_author_filter(
+        self, knowledge_manager: KnowledgeManager, search_engine: SearchEngine
+    ):
+        """SearchEngine.semantic_search() correctly wires author filter to ChromaIndex."""
+        alice_doc = (
+            await knowledge_manager.create(
+                title="Alice's ML Notes",
+                content="Reinforcement learning policy gradients and reward shaping.",
+                agent="alice",
+            )
+        ).document
+        bob_doc = (
+            await knowledge_manager.create(
+                title="Bob's ML Notes",
+                content="Reinforcement learning policy gradients and reward shaping.",
+                agent="bob",
+            )
+        ).document
+        search_engine.index_document(alice_doc)
+        search_engine.index_document(bob_doc)
+
+        results = search_engine.semantic_search(
+            "reinforcement learning", limit=10, threshold=0.0, author="alice"
+        )
+        result_ids = [r.id for r in results]
+
+        assert alice_doc.id in result_ids
+        assert bob_doc.id not in result_ids
+
+    @pytest.mark.asyncio
+    async def test_semantic_search_engine_wires_path_prefix_filter(
+        self, knowledge_manager: KnowledgeManager, search_engine: SearchEngine
+    ):
+        """SearchEngine.semantic_search() correctly wires path_prefix filter to ChromaIndex."""
+        arch_doc = (
+            await knowledge_manager.create(
+                title="Architecture Doc",
+                content="Event-driven architecture with message queues and async processing.",
+                agent="agent",
+                path="architecture",
+            )
+        ).document
+        other_doc = (
+            await knowledge_manager.create(
+                title="Other Doc",
+                content="Event-driven architecture with message queues and async processing.",
+                agent="agent",
+                path="scratch",
+            )
+        ).document
+        search_engine.index_document(arch_doc)
+        search_engine.index_document(other_doc)
+
+        results = search_engine.semantic_search(
+            "event-driven message queues", limit=10, threshold=0.0, path_prefix="architecture"
+        )
+        result_ids = [r.id for r in results]
+
+        assert arch_doc.id in result_ids
+        assert other_doc.id not in result_ids
+
+
 class TestSearchEngineResiliency:
     """Tests for error propagation and partial-failure handling in SearchEngine."""
 

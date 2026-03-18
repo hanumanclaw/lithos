@@ -913,8 +913,18 @@ class SearchEngine:
         limit: int = 10,
         threshold: float | None = None,
         tags: list[str] | None = None,
+        author: str | None = None,
+        path_prefix: str | None = None,
     ) -> list[SemanticResult]:
         """Semantic search using ChromaDB.
+
+        Args:
+            query: Natural language query
+            limit: Maximum results
+            threshold: Minimum similarity 0-1 (default: config value)
+            tags: Filter by tags (AND)
+            author: Filter by author
+            path_prefix: Filter by path prefix
 
         Raises:
             SearchBackendError: If the ChromaDB backend raises an exception.
@@ -931,6 +941,8 @@ class SearchEngine:
                 limit=limit,
                 threshold=threshold,
                 tags=tags,
+                author=author,
+                path_prefix=path_prefix,
             )
         except Exception as exc:
             success = False
