@@ -1,7 +1,7 @@
 # Lithos - Specification
 
-Version: 0.1.4
-Date: 2026-03-17
+Version: 0.1.5
+Date: 2026-03-18
 Status: Aligned with Implementation
 
 ---
@@ -323,42 +323,35 @@ Delete a knowledge file.
 | Name | Type | Required | Description |
 |------|------|----------|-------------|
 | `id` | string | Yes | UUID of knowledge item to delete |
-| `agent` | string | No | Agent performing deletion (for audit trail) |
+| `agent` | string | Yes | Agent performing deletion (required for audit trail and auto-registration) |
 
-**Returns:** `{ success: boolean }`
+**Returns:** `{ success: true }` on success, or `{ status: "error", code: "doc_not_found", message: string }` if the document does not exist.
 
 #### `lithos_search`
-Full-text search across knowledge base.
+Unified search across the knowledge base.
 
 **Arguments:**
 | Name | Type | Required | Description |
 |------|------|----------|-------------|
-| `query` | string | Yes | Search query (Tantivy query syntax) |
+| `query` | string | Yes | Search query |
 | `limit` | int | No | Max results (default: 10) |
+| `mode` | string | No | `"hybrid"` \| `"fulltext"` \| `"semantic"` (default: `"hybrid"`) |
 | `tags` | string[] | No | Filter by tags (AND) |
 | `author` | string | No | Filter by author |
 | `path_prefix` | string | No | Filter by path prefix |
+| `threshold` | float | No | Minimum similarity 0-1 for semantic/hybrid (default: 0.5) |
 
 **Returns:** `{ results: [{ id, title, snippet, score, path, source_url, updated_at, is_stale, derived_from_ids }] }`
 
-**Snippet source:** Snippet showing matching terms in context.
+**Modes:**
+- `hybrid`: Reciprocal Rank Fusion over full-text and semantic results
+- `fulltext`: Tantivy BM25 search
+- `semantic`: ChromaDB vector similarity search
 
-#### `lithos_semantic`
-Semantic similarity search.
-
-**Arguments:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `query` | string | Yes | Natural language query |
-| `limit` | int | No | Max results (default: 10) |
-| `threshold` | float | No | Minimum similarity 0-1 (default: from config, 0.3) |
-| `tags` | string[] | No | Filter by tags |
-
-**Returns:** `{ results: [{ id, title, snippet, similarity, path, source_url, updated_at, is_stale, derived_from_ids }] }`
-
-**Snippet source:** Content of the best-matching chunk for each document.
-
-**Note:** Search operates on chunks internally but returns deduplicated documents.
+**Notes:**
+- Search operates on chunks internally but returns deduplicated documents.
+- In `semantic` mode, the returned `score` is the semantic similarity value.
+- Invalid `mode` returns `{ status: "error", code: "invalid_mode", message }`.
 
 #### `lithos_cache_lookup`
 Check the knowledge base for a cached answer before performing expensive research.
@@ -430,8 +423,14 @@ List knowledge items with filters.
 | `since` | string | No | Filter by updated date (ISO 8601) |
 | `limit` | int | No | Max results (default: 50) |
 | `offset` | int | No | Pagination offset |
+| `title_contains` | string | No | Case-insensitive substring match on title |
+| `content_query` | string | No | Tantivy full-text query applied after the base filters |
 
 **Returns:** `{ items: [{ id, title, path, updated, tags, source_url, derived_from_ids }], total: int }`
+
+**Behavior:**
+- When `title_contains` or `content_query` is present, Lithos fetches the full base-filtered set first, then applies post-filters before pagination. This keeps `items` and `total` correct across pages.
+- `content_query` backend failures return `{ status: "error", code: "search_backend_error", message }`.
 
 ### 5.2 Graph Operations
 
@@ -452,7 +451,10 @@ Get links for a knowledge item.
 #### `lithos_tags`
 List all tags with document counts.
 
-**Arguments:** None
+**Arguments:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `prefix` | string | No | Case-insensitive prefix filter on tag names |
 
 **Returns:** `{ tags: { name: count, ... } }`
 
@@ -544,6 +546,24 @@ Create a coordination task.
 
 **Returns:** `{ task_id: string }`
 
+#### `lithos_task_update`
+Update mutable task metadata.
+
+**Arguments:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `task_id` | string | Yes | Task ID |
+| `agent` | string | Yes | Agent making the update |
+| `title` | string | No | Replacement title |
+| `description` | string | No | Replacement description |
+| `tags` | string[] | No | Replacement tags |
+
+**Returns:** `{ success: true, message }` on success, otherwise `{ success: false, message }`.
+
+**Behavior:**
+- At least one of `title`, `description`, or `tags` must be provided.
+- Only `open` tasks can be updated. Completed and cancelled tasks are treated as not found at the MCP boundary.
+
 #### `lithos_task_claim`
 Claim an aspect of a task.
 
@@ -555,7 +575,7 @@ Claim an aspect of a task.
 | `agent` | string | Yes | Your agent identifier |
 | `ttl_minutes` | int | No | Claim duration (default: 60, max: 480) |
 
-**Returns:** `{ success: boolean, expires_at: string }`
+**Returns:** `{ success: true, expires_at: string }` on success, or `{ status: "error", code: "claim_failed", message }` on failure.
 
 #### `lithos_task_renew`
 Extend an existing task claim.
@@ -568,7 +588,7 @@ Extend an existing task claim.
 | `agent` | string | Yes | Your agent identifier |
 | `ttl_minutes` | int | No | New duration from now (default: 60, max: 480) |
 
-**Returns:** `{ success: boolean, new_expires_at: string }`
+**Returns:** `{ success: true, new_expires_at: string }` on success, or `{ status: "error", code: "claim_not_found", message }` on failure.
 
 **Note:** Only the agent holding the claim can renew it.
 
@@ -582,7 +602,7 @@ Release a task claim.
 | `aspect` | string | Yes | The aspect claim to release |
 | `agent` | string | Yes | Your agent identifier |
 
-**Returns:** `{ success: boolean }`
+**Returns:** `{ success: true }` on success, or `{ status: "error", code: "claim_not_found", message }` if no matching claim exists.
 
 #### `lithos_task_complete`
 Mark a task as completed.
@@ -593,9 +613,36 @@ Mark a task as completed.
 | `task_id` | string | Yes | Task ID |
 | `agent` | string | Yes | Agent marking completion |
 
-**Returns:** `{ success: boolean }`
+**Returns:** `{ success: true }` on success, or `{ status: "error", code: "task_not_found", message }` if the task does not exist or is not open.
 
 **Behavior:** Sets task status to 'completed' and releases all active claims on the task.
+
+#### `lithos_task_cancel`
+Cancel a task and release all claims.
+
+**Arguments:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `task_id` | string | Yes | Task ID |
+| `agent` | string | Yes | Agent cancelling the task |
+| `reason` | string | No | Optional cancellation reason |
+
+**Returns:** `{ success: boolean }`
+
+**Behavior:** Marks an open task as `cancelled` and deletes all claims on that task. The optional `reason` is accepted by the MCP surface but is not persisted in SQLite.
+
+#### `lithos_task_list`
+List tasks with optional filters.
+
+**Arguments:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `agent` | string | No | Filter by creating agent |
+| `status` | string | No | Filter by task status: `open`, `completed`, or `cancelled` |
+| `tags` | string[] | No | Filter to tasks containing all listed tags |
+| `since` | string | No | Filter by `created_at >= since` (ISO datetime) |
+
+**Returns:** `{ tasks: [{ id, title, description, status, created_by, created_at, tags }] }`
 
 #### `lithos_task_status`
 Get task status and claims.
@@ -603,7 +650,7 @@ Get task status and claims.
 **Arguments:**
 | Name | Type | Required | Description |
 |------|------|----------|-------------|
-| `task_id` | string | No | Specific task; omit for all active tasks |
+| `task_id` | string | Yes | Specific task ID |
 
 **Returns:** `{ tasks: [{ id, title, status, claims: [{ agent, aspect, expires_at }] }] }`
 
@@ -794,13 +841,14 @@ Lithos includes an in-memory event bus that emits `LithosEvent` on all write, de
 | `task.claimed` | `lithos_task_claim` | `task_id`, `agent`, `aspect` |
 | `task.released` | `lithos_task_release` | `task_id`, `agent`, `aspect` |
 | `task.completed` | `lithos_task_complete` | `task_id`, `agent` |
+| `task.cancelled` | `lithos_task_cancel` | `task_id`, `agent`, `reason` |
 | `finding.posted` | `lithos_finding_post` | `finding_id`, `task_id`, `agent` |
 | `agent.registered` | `lithos_agent_register` | `agent_id`, `name` |
-| `batch.queued` | *(future — Phase 5)* | — |
-| `batch.applying` | *(future — Phase 5)* | — |
-| `batch.projecting` | *(future — Phase 5)* | — |
-| `batch.completed` | *(future — Phase 5)* | — |
-| `batch.failed` | *(future — Phase 5)* | — |
+| `batch.queued` | Defined constant only; not currently emitted by server tool paths | — |
+| `batch.applying` | Defined constant only; not currently emitted by server tool paths | — |
+| `batch.projecting` | Defined constant only; not currently emitted by server tool paths | — |
+| `batch.completed` | Defined constant only; not currently emitted by server tool paths | — |
+| `batch.failed` | Defined constant only; not currently emitted by server tool paths | — |
 
 ### 8.3 Emission Points
 
@@ -870,7 +918,7 @@ Configuration is managed via `pydantic-settings` (`LithosConfig`). Values are re
 # Server configuration
 server:
   transport: stdio          # stdio | sse
-  host: 0.0.0.0            # Bind address (all interfaces for Docker compatibility)
+  host: 127.0.0.1          # Default bind address
   port: 8765               # For SSE transport
   watch_files: true         # Enable file watcher for index updates
 
@@ -878,6 +926,7 @@ server:
 storage:
   data_dir: ./data         # Base data directory
   knowledge_subdir: knowledge # Relative to data_dir
+  max_content_size_bytes: 1000000 # Reject larger MCP writes
 
 # Search configuration
 search:
@@ -963,17 +1012,23 @@ lithos --data-dir ./data inspect doc <id-or-path> --content
 Tools indicate routine domain failures through return values, and unexpected backend failures may still surface as MCP-level exceptions.
 
 - **Structured status envelopes**: `lithos_write` returns `{ status: "error", code, message, ... }` for invalid input and contract-level failures
-- **Boolean success fields**: Coordination and delete operations return `{ success: false }` on expected failure paths
+- **Structured error envelopes on many tools**: `lithos_delete`, `lithos_task_claim`, `lithos_task_renew`, `lithos_task_release`, `lithos_task_complete`, `lithos_search`, `lithos_list`, and `lithos_cache_lookup` use `{ status: "error", code, message }` for routine domain failures
+- **Boolean success fields**: `lithos_task_update` and `lithos_task_cancel` use `{ success: false, ... }` on expected failure paths
 - **Nullable results**: `lithos_agent_info` returns `null` when the agent is not found
-- **Exceptions**: `lithos_read` for missing documents and unexpected file/index/backend errors can propagate as MCP-level exceptions
+- **Exceptions**: Unexpected file/index/backend errors may still propagate at the MCP layer
 
 ### 10.2 Error Scenarios
 
 | Scenario | Behavior |
 |----------|----------|
-| Knowledge item not found | `lithos_read` raises a not-found error at the MCP layer; `lithos_delete` returns `{ success: false }` |
-| Claim conflict (aspect taken) | `lithos_task_claim` returns `{ success: false }` |
-| Claim renewal by wrong agent | `lithos_task_renew` returns `{ success: false }` |
+| Knowledge item not found | `lithos_read` returns `{ status: "error", code: "doc_not_found" }`; `lithos_delete` returns the same envelope |
+| Unknown search mode | `lithos_search` returns `{ status: "error", code: "invalid_mode" }` |
+| Search backend failure during `lithos_list(content_query=...)` | `lithos_list` returns `{ status: "error", code: "search_backend_error" }` |
+| Search backend failure during cache lookup fallback | `lithos_cache_lookup` returns `{ status: "error", code: "search_backend_error" }` |
+| Claim conflict (aspect taken / task closed / task missing) | `lithos_task_claim` returns `{ status: "error", code: "claim_failed" }` |
+| Claim renewal by wrong agent or missing claim | `lithos_task_renew` returns `{ status: "error", code: "claim_not_found" }` |
+| Claim release with no matching claim | `lithos_task_release` returns `{ status: "error", code: "claim_not_found" }` |
+| Completing unknown or non-open task | `lithos_task_complete` returns `{ status: "error", code: "task_not_found" }` |
 | Invalid arguments | FastMCP validation rejects the call |
 | Ambiguous wiki-link | Link treated as unresolved (no error raised) |
 | Write content exceeds configured limit | `lithos_write` returns `{ status: "error", code: "content_too_large" }` |
@@ -996,11 +1051,10 @@ These are explicitly not part of the initial implementation but may be considere
 - Contradictory knowledge resolution
 - Integration with external knowledge sources
 - Full edit history / provenance log
-- `lithos_task_cancel` tool
 - Hierarchical multi-hop link results
 - Structured MCP error codes (`NOT_FOUND`, `CLAIM_CONFLICT`, `AMBIGUOUS_LINK`, etc.)
 - ~~Structured `source` provenance with `derived_from` links to source knowledge items~~ (Implemented in Phase 3 via `derived_from_ids` and `lithos_provenance`)
-- `lithos_tags` filtering: accept a `tag` parameter to return documents with that tag
+- ~~`lithos_tags` prefix filtering~~ (Implemented via `prefix`)
 - `lithos_delete` audit trail logging (record which agent deleted what)
 
 ---
@@ -1021,8 +1075,8 @@ These are explicitly not part of the initial implementation but may be considere
 ← { status: "created", id: "abc-123", path: "python-asyncio-gather-patterns.md", version: 1, warnings: [] }
 
 # OpenClaw searches for async knowledge (semantic search uses chunks internally)
-→ lithos_semantic(query="how to run async tasks concurrently in python")
-← { results: [{ id: "abc-123", title: "Python asyncio.gather patterns", similarity: 0.89, snippet: "...best matching chunk..." }] }
+→ lithos_search(query="how to run async tasks concurrently in python", mode="semantic")
+← { results: [{ id: "abc-123", title: "Python asyncio.gather patterns", score: 0.89, snippet: "...best matching chunk..." }] }
 
 # OpenClaw reads with truncation to avoid context flooding
 → lithos_read(id="abc-123", max_length=2000)
@@ -1063,13 +1117,13 @@ These are explicitly not part of the initial implementation but may be considere
 
 | Category | Tools |
 |----------|-------|
-| Knowledge | `lithos_write`, `lithos_read`, `lithos_delete`, `lithos_search`, `lithos_semantic`, `lithos_list`, `lithos_cache_lookup` |
+| Knowledge | `lithos_write`, `lithos_read`, `lithos_delete`, `lithos_search`, `lithos_list`, `lithos_cache_lookup` |
 | Graph | `lithos_links`, `lithos_tags`, `lithos_provenance` |
 | Agent | `lithos_agent_register`, `lithos_agent_info`, `lithos_agent_list` |
-| Coordination | `lithos_task_create`, `lithos_task_claim`, `lithos_task_renew`, `lithos_task_release`, `lithos_task_complete`, `lithos_task_status`, `lithos_finding_post`, `lithos_finding_list` |
-| System | `lithos_stats`, `lithos_health` |
+| Coordination | `lithos_task_create`, `lithos_task_update`, `lithos_task_claim`, `lithos_task_renew`, `lithos_task_release`, `lithos_task_complete`, `lithos_task_cancel`, `lithos_task_list`, `lithos_task_status`, `lithos_finding_post`, `lithos_finding_list` |
+| System | `lithos_stats` |
 
-**Total: 22 MCP tools**
+**Total: 24 MCP tools**
 
 ---
 
