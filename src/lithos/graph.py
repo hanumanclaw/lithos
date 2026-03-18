@@ -104,6 +104,7 @@ class KnowledgeGraph:
             self._alias_to_node = data.get("alias_to_node", {})
             return True
         except Exception:
+            logger.exception("Failed to load graph cache")
             return False
 
     def save_cache(self) -> None:

@@ -1941,6 +1941,24 @@ class TestHealthEndpoint:
         assert result["components"]["kb_directory"]["error"] == "directory does not exist"
 
     @pytest.mark.asyncio
+    async def test_health_degraded_when_kb_directory_missing_real_path(
+        self, server: LithosServer, tmp_path: Path
+    ):
+        """_get_health correctly uses Path.exists() for a real non-existent directory (issue #75)."""
+        from unittest.mock import patch
+
+        nonexistent = tmp_path / "does_not_exist"
+        # Confirm the directory is genuinely absent before patching
+        assert not nonexistent.exists()
+
+        with patch.object(server.knowledge, "knowledge_path", nonexistent):
+            result = await server._get_health()
+
+        assert result["status"] == "degraded"
+        assert result["components"]["kb_directory"]["status"] == "unavailable"
+        assert result["components"]["kb_directory"]["error"] == "directory does not exist"
+
+    @pytest.mark.asyncio
     async def test_health_degraded_when_kb_list_fails(self, server: LithosServer):
         """_get_health returns degraded when knowledge base list_all raises."""
         from unittest.mock import AsyncMock, patch

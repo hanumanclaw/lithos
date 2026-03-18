@@ -51,7 +51,7 @@ class TestConfigDefaults:
         """Server config has sensible defaults."""
         config = ServerConfig()
 
-        assert config.host == "0.0.0.0"
+        assert config.host == "127.0.0.1"
         assert config.port > 0
         assert config.watch_files is True
 
