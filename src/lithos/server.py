@@ -863,9 +863,24 @@ class LithosServer:
 
                 valid_modes = {"hybrid", "fulltext", "semantic"}
                 if mode not in valid_modes:
-                    raise ValueError(
-                        f"Unknown search mode {mode!r}. Valid values: hybrid, fulltext, semantic."
-                    )
+                    return {
+                        "status": "error",
+                        "code": "invalid_mode",
+                        "message": f"Unknown search mode {mode!r}. Valid values: hybrid, fulltext, semantic.",
+                    }
+
+                def _build_result(r: Any, score_attr: str = "score") -> dict[str, Any]:
+                    return {
+                        "id": r.id,
+                        "title": r.title,
+                        "snippet": r.snippet,
+                        "score": getattr(r, score_attr),
+                        "path": r.path,
+                        "source_url": r.source_url,
+                        "updated_at": r.updated_at,
+                        "is_stale": r.is_stale,
+                        "derived_from_ids": self.knowledge.get_doc_sources(r.id),
+                    }
 
                 if mode == "fulltext":
                     ft_results = self.search.full_text_search(
@@ -875,20 +890,7 @@ class LithosServer:
                         author=author,
                         path_prefix=path_prefix,
                     )
-                    results_payload = [
-                        {
-                            "id": r.id,
-                            "title": r.title,
-                            "snippet": r.snippet,
-                            "score": r.score,
-                            "path": r.path,
-                            "source_url": r.source_url,
-                            "updated_at": r.updated_at,
-                            "is_stale": r.is_stale,
-                            "derived_from_ids": self.knowledge.get_doc_sources(r.id),
-                        }
-                        for r in ft_results
-                    ]
+                    results_payload = [_build_result(r) for r in ft_results]
                 elif mode == "semantic":
                     sem_results = self.search.semantic_search(
                         query=query,
@@ -898,20 +900,7 @@ class LithosServer:
                         author=author,
                         path_prefix=path_prefix,
                     )
-                    results_payload = [
-                        {
-                            "id": r.id,
-                            "title": r.title,
-                            "snippet": r.snippet,
-                            "score": r.similarity,
-                            "path": r.path,
-                            "source_url": r.source_url,
-                            "updated_at": r.updated_at,
-                            "is_stale": r.is_stale,
-                            "derived_from_ids": self.knowledge.get_doc_sources(r.id),
-                        }
-                        for r in sem_results
-                    ]
+                    results_payload = [_build_result(r, score_attr="similarity") for r in sem_results]
                 else:
                     # hybrid (default)
                     hybrid_results = self.search.hybrid_search(
@@ -922,20 +911,7 @@ class LithosServer:
                         author=author,
                         path_prefix=path_prefix,
                     )
-                    results_payload = [
-                        {
-                            "id": r.id,
-                            "title": r.title,
-                            "snippet": r.snippet,
-                            "score": r.score,
-                            "path": r.path,
-                            "source_url": r.source_url,
-                            "updated_at": r.updated_at,
-                            "is_stale": r.is_stale,
-                            "derived_from_ids": self.knowledge.get_doc_sources(r.id),
-                        }
-                        for r in hybrid_results
-                    ]
+                    results_payload = [_build_result(r) for r in hybrid_results]
 
                 span.set_attribute("lithos.result_count", len(results_payload))
                 logger.info("lithos_search mode=%s results=%d", mode, len(results_payload))
