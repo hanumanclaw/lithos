@@ -639,6 +639,8 @@ class ChromaIndex:
         limit: int = 10,
         threshold: float = 0.5,
         tags: list[str] | None = None,
+        author: str | None = None,
+        path_prefix: str | None = None,
     ) -> list[SemanticResult]:
         """Semantic search.
 
@@ -647,6 +649,8 @@ class ChromaIndex:
             limit: Maximum results
             threshold: Minimum similarity (0-1)
             tags: Filter by tags
+            author: Filter by author (exact match)
+            path_prefix: Filter by path prefix
 
         Returns:
             List of semantic results (deduplicated by document)
@@ -696,6 +700,14 @@ class ChromaIndex:
                 doc_tags = str(metadata.get("tags", "")).split(",")
                 if not all(t in doc_tags for t in tags):
                     continue
+
+            # Apply author filter
+            if author and str(metadata.get("author", "")) != author:
+                continue
+
+            # Apply path prefix filter
+            if path_prefix and not str(metadata.get("path", "")).startswith(path_prefix):
+                continue
 
             seen_docs.add(doc_id)
             expires_at_str = str(metadata.get("expires_at", ""))
@@ -982,6 +994,8 @@ class SearchEngine:
                     if threshold is not None
                     else self.config.search.semantic_threshold,
                     tags=tags,
+                    author=author,
+                    path_prefix=path_prefix,
                 )
             except Exception as exc:
                 logger.warning("Hybrid search: semantic backend failed: %s", exc)
