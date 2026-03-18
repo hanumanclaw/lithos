@@ -900,7 +900,9 @@ class LithosServer:
                         author=author,
                         path_prefix=path_prefix,
                     )
-                    results_payload = [_build_result(r, score_attr="similarity") for r in sem_results]
+                    results_payload = [
+                        _build_result(r, score_attr="similarity") for r in sem_results
+                    ]
                 else:
                     # hybrid (default)
                     hybrid_results = self.search.hybrid_search(
