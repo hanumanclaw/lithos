@@ -4,11 +4,21 @@
 
 A local, privacy-first knowledge base that enables heterogeneous AI agents to share knowledge and coordinate work.
 
+## The Problem
+
+Enterprise AI adoption is stalling at the infrastructure layer. According to a [Computer Weekly / IDC survey](https://www.computerweekly.com/), **only 2% of enterprises have deployed AI at scale** — despite a potential **$450B market opportunity**. A [2025 NBER study of 6,000 executives](https://www.nber.org/) found that the primary barrier is the absence of reliable, shared knowledge infrastructure.
+
+When agents cannot share what they know, every agent starts from zero. Work is duplicated, discoveries are lost, and coordination breaks down. Lithos solves this by providing a **persistent, shared knowledge layer** that compounds in value over time.
+
 ## What It Is
 
 Lithos is an MCP server that provides a shared knowledge store for AI agents running on your local infrastructure. Knowledge is stored as human-readable Markdown files (compatible with Obsidian) while providing fast full-text and semantic search for agents.
 
 ## Who It's For
+
+Lithos is the **Knowledge Layer** for teams running AI agents in production.
+
+Just as Alation coined the term "Knowledge Layer" for enterprise data governance, Lithos provides the equivalent for AI agent systems: a structured, searchable, shared memory that **compounds in value** the more it is used. Each agent interaction enriches the knowledge base, making every subsequent agent smarter and faster.
 
 - Teams running multiple AI agents (Agent Zero, OpenClaw, Claude Code, custom agents)
 - Developers who want agents to share discoveries and avoid duplicate work
