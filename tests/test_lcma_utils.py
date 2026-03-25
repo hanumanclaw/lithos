@@ -138,19 +138,19 @@ class TestMultipleScouts:
         candidates = [
             _candidate("a", 400.0, scout="lexical"),  # BM25
             _candidate("b", 100.0, scout="lexical"),  # BM25
-            _candidate("c", 0.9, scout="vector"),     # cosine
-            _candidate("d", 0.3, scout="vector"),     # cosine
+            _candidate("c", 0.9, scout="vector"),  # cosine
+            _candidate("d", 0.3, scout="vector"),  # cosine
         ]
         result = merge_and_normalize(candidates)
         by_node = _by_node(result)
 
         # lexical group: lo=100, hi=400, span=300
-        assert by_node["a"].score == pytest.approx(1.0)        # (400-100)/300 = 1.0
-        assert by_node["b"].score == pytest.approx(0.0)        # (100-100)/300 = 0.0
+        assert by_node["a"].score == pytest.approx(1.0)  # (400-100)/300 = 1.0
+        assert by_node["b"].score == pytest.approx(0.0)  # (100-100)/300 = 0.0
 
         # vector group: lo=0.3, hi=0.9, span=0.6
-        assert by_node["c"].score == pytest.approx(1.0)        # (0.9-0.3)/0.6 = 1.0
-        assert by_node["d"].score == pytest.approx(0.0)        # (0.3-0.3)/0.6 = 0.0
+        assert by_node["c"].score == pytest.approx(1.0)  # (0.9-0.3)/0.6 = 1.0
+        assert by_node["d"].score == pytest.approx(0.0)  # (0.3-0.3)/0.6 = 0.0
 
     def test_scouts_with_single_member_each_score_one(self) -> None:
         candidates = [
@@ -183,7 +183,7 @@ class TestDuplicateNodeIdAcrossScouts:
     def test_max_score_wins(self) -> None:
         """Same node from two different scouts — merged candidate keeps the higher score."""
         candidates = [
-            _candidate("shared", 0.8, scout="vector"),   # normalises to 1.0 (solo)
+            _candidate("shared", 0.8, scout="vector"),  # normalises to 1.0 (solo)
             _candidate("shared", 0.4, scout="lexical"),  # normalises to 1.0 (solo)
         ]
         result = merge_and_normalize(candidates)
