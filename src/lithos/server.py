@@ -883,7 +883,8 @@ class LithosServer:
                     }
 
                 if mode == "fulltext":
-                    ft_results = self.search.full_text_search(
+                    ft_results = await asyncio.to_thread(
+                        self.search.full_text_search,
                         query=query,
                         limit=limit,
                         tags=tags,
@@ -892,7 +893,8 @@ class LithosServer:
                     )
                     results_payload = [_build_result(r) for r in ft_results]
                 elif mode == "semantic":
-                    sem_results = self.search.semantic_search(
+                    sem_results = await asyncio.to_thread(
+                        self.search.semantic_search,
                         query=query,
                         limit=limit,
                         threshold=threshold,
@@ -905,7 +907,8 @@ class LithosServer:
                     ]
                 else:
                     # hybrid (default)
-                    hybrid_results = self.search.hybrid_search(
+                    hybrid_results = await asyncio.to_thread(
+                        self.search.hybrid_search,
                         query=query,
                         limit=limit,
                         threshold=threshold,
@@ -996,7 +999,8 @@ class LithosServer:
                 # Fallback: semantic search
                 if not candidates:
                     try:
-                        sem_results = self.search.semantic_search(
+                        sem_results = await asyncio.to_thread(
+                            self.search.semantic_search,
                             query=query,
                             limit=limit,
                             threshold=0.0,
@@ -1178,9 +1182,8 @@ class LithosServer:
 
                     if content_query is not None:
                         try:
-                            # TODO: run in executor — full_text_search is sync and
-                            #       should not block the event loop.
-                            fts_results = self.search.full_text_search(
+                            fts_results = await asyncio.to_thread(
+                                self.search.full_text_search,
                                 query=content_query,
                                 # Use total_base as the cap so we never silently
                                 # truncate matches from the base-filtered set.

@@ -39,6 +39,8 @@ TASK_CANCELLED = "task.cancelled"
 
 FINDING_POSTED = "finding.posted"
 
+EDGE_UPSERTED = "edge.upserted"
+
 AGENT_REGISTERED = "agent.registered"
 
 BATCH_QUEUED = "batch.queued"
@@ -46,6 +48,12 @@ BATCH_APPLYING = "batch.applying"
 BATCH_PROJECTING = "batch.projecting"
 BATCH_COMPLETED = "batch.completed"
 BATCH_FAILED = "batch.failed"
+
+# Subscriber queue sizing for background workers.
+# The default EventBus subscriber queue is 100, which silently drops events
+# under load. lithos-enrich subscribes with a much larger queue to survive
+# bursts during bulk writes or full-sweep cycles (see design doc §8.10).
+ENRICH_SUBSCRIBER_QUEUE_SIZE = 10_000
 
 
 @dataclass
