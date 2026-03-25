@@ -135,12 +135,23 @@ class EventBus:
         self,
         event_types: list[str] | None = None,
         tags: list[str] | None = None,
+        maxsize: int | None = None,
     ) -> asyncio.Queue[LithosEvent]:
         """Subscribe to events, optionally filtered by type and/or tags.
 
         Returns a bounded asyncio.Queue that will receive matching events.
+
+        Args:
+            event_types: If provided, only events whose ``type`` is in this
+                list will be delivered to this subscriber.
+            tags: If provided, only events that carry at least one of these
+                tags will be delivered.
+            maxsize: Override the default subscriber queue size.  Pass
+                ``ENRICH_SUBSCRIBER_QUEUE_SIZE`` here to absorb write bursts
+                without dropping events (see design doc §8.10).
         """
-        queue: asyncio.Queue[LithosEvent] = asyncio.Queue(maxsize=self._queue_size)
+        q_size = maxsize if maxsize is not None else self._queue_size
+        queue: asyncio.Queue[LithosEvent] = asyncio.Queue(maxsize=q_size)
         sub = _Subscriber(queue=queue, event_types=event_types, tag_filter=tags)
         self._subscribers.append(sub)
         return queue

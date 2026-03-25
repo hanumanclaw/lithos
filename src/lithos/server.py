@@ -882,6 +882,13 @@ class LithosServer:
                         "derived_from_ids": self.knowledge.get_doc_sources(r.id),
                     }
 
+                # Thread safety note: SearchManager read methods (full_text_search, semantic_search,
+                # hybrid_search) are wrapped in asyncio.to_thread() to avoid blocking the event loop.
+                # Concurrent reads via tantivy-py and ChromaDB are safe. Known risk: lithos_write
+                # calls index_document() synchronously without to_thread() — concurrent read+write
+                # is not protected by a lock. This is an existing limitation pre-LCMA; tracked for
+                # future hardening. ChromaDB model init race on ensure_embeddings_loaded() is
+                # mitigated by the existing warmup call at server startup.
                 if mode == "fulltext":
                     ft_results = await asyncio.to_thread(
                         self.search.full_text_search,
