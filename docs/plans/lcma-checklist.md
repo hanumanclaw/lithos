@@ -17,6 +17,7 @@ Exit criteria (all MVPs):
 - [ ] Wrap `full_text_search()`, `semantic_search()`, and `hybrid_search()` calls in `asyncio.to_thread()` at call sites — sync search must not block the event loop when LCMA adds 7+ parallel scouts (see design doc §5.13)
 - [ ] Implement `merge_and_normalize()` with per-scout min-max normalization to `[0, 1]` — all `lithos_retrieve` scores must be normalized (see design doc §5.3.1); `lithos_search` scores are unchanged
 - [ ] Add `EDGE_UPSERTED = "edge.upserted"` event type to `events.py` — all state changes must flow through the event bus (see design doc §3.1 runtime architecture)
+- [ ] Bump `lithos-enrich` subscriber queue size to ~10,000 (default is 100, drops silently under load — see design doc §8.10); configure at subscribe time via the EventBus `subscribe()` call in the enrich worker
 
 ---
 
@@ -33,7 +34,17 @@ Exit criteria (all MVPs):
 - [ ] Add `summaries` nested object (`short`, `long`) (optional)
   - MVP 1: agent-written only (via `lithos_write`); MVP 2: `lithos-enrich` may auto-generate for notes where `summaries` is empty and `note_type` is `concept`/`summary` — agent-written values take precedence
 - [ ] Extend `lithos_write` with optional LCMA params while preserving shared write contract and status envelope
-- [ ] Define preserve/set/clear semantics for each new `lithos_write` LCMA field before implementation
+- [x] ~~Define preserve/set/clear semantics for each new `lithos_write` LCMA field before implementation~~ — **Resolved:** Preserve if already set; write default on first touch (write-back-on-touch). Exception: `namespace` — derive at read time only, persist only if explicitly passed by caller.
+
+  | Field | On update, if omitted |
+  |---|---|
+  | `schema_version` | Write default (1) if absent |
+  | `note_type` | Write default (`observation`) if absent; preserve if already set |
+  | `access_scope` | Write default (`shared`) if absent; preserve if already set |
+  | `status` | Write default (`active`) if absent; preserve if already set |
+  | `summaries` | Leave absent if not provided; do not overwrite with null |
+  | `namespace` | Derive at read time; persist only if explicitly passed |
+
 - [ ] Implement lazy defaults + write-back-on-touch for LCMA fields (no migration runner in MVP 1)
 
 ### Storage
