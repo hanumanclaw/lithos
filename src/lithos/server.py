@@ -882,8 +882,16 @@ class LithosServer:
                         "derived_from_ids": self.knowledge.get_doc_sources(r.id),
                     }
 
+                # Thread safety note: SearchManager read methods (full_text_search, semantic_search,
+                # hybrid_search) are wrapped in asyncio.to_thread() to avoid blocking the event loop.
+                # Concurrent reads via tantivy-py and ChromaDB are safe. Known risk: lithos_write
+                # calls index_document() synchronously without to_thread() — concurrent read+write
+                # is not protected by a lock. This is an existing limitation pre-LCMA; tracked for
+                # future hardening. ChromaDB model init race on ensure_embeddings_loaded() is
+                # mitigated by the existing warmup call at server startup.
                 if mode == "fulltext":
-                    ft_results = self.search.full_text_search(
+                    ft_results = await asyncio.to_thread(
+                        self.search.full_text_search,
                         query=query,
                         limit=limit,
                         tags=tags,
@@ -892,7 +900,8 @@ class LithosServer:
                     )
                     results_payload = [_build_result(r) for r in ft_results]
                 elif mode == "semantic":
-                    sem_results = self.search.semantic_search(
+                    sem_results = await asyncio.to_thread(
+                        self.search.semantic_search,
                         query=query,
                         limit=limit,
                         threshold=threshold,
@@ -905,7 +914,8 @@ class LithosServer:
                     ]
                 else:
                     # hybrid (default)
-                    hybrid_results = self.search.hybrid_search(
+                    hybrid_results = await asyncio.to_thread(
+                        self.search.hybrid_search,
                         query=query,
                         limit=limit,
                         threshold=threshold,
@@ -996,7 +1006,8 @@ class LithosServer:
                 # Fallback: semantic search
                 if not candidates:
                     try:
-                        sem_results = self.search.semantic_search(
+                        sem_results = await asyncio.to_thread(
+                            self.search.semantic_search,
                             query=query,
                             limit=limit,
                             threshold=0.0,
@@ -1178,9 +1189,8 @@ class LithosServer:
 
                     if content_query is not None:
                         try:
-                            # TODO: run in executor — full_text_search is sync and
-                            #       should not block the event loop.
-                            fts_results = self.search.full_text_search(
+                            fts_results = await asyncio.to_thread(
+                                self.search.full_text_search,
                                 query=content_query,
                                 # Use total_base as the cap so we never silently
                                 # truncate matches from the base-filtered set.
