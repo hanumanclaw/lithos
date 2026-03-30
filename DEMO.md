@@ -6,12 +6,12 @@
 PR fix/issue-121-lithos-read-filenotfound ensures lithos_read never raises a raw FileNotFoundError. Non-existent documents (by id or path) always return a structured error envelope with status=error and code=doc_not_found.
 
 ```bash
-uv run --extra dev pytest tests/test_server.py::TestKnowledgeToolWorkflow::test_lithos_read_nonexistent_doc_does_not_raise tests/test_server.py::TestKnowledgeToolWorkflow::test_lithos_read_missing_id_returns_structured_error tests/test_server.py::TestKnowledgeToolWorkflow::test_lithos_read_missing_path_returns_structured_error -v 2>&1 | sed 's/[0-9]*\.[0-9]*s *(0:[0-9:]*)//g' | sed 's/ in [0-9]*\.[0-9]*s/ in Xs/g' | sed 's|-- /.*\.venv/bin/python3|-- .venv/bin/python3|g' | sed 's|rootdir: /.*|rootdir: .|g'
+uv run --extra dev pytest tests/test_server.py::TestKnowledgeToolWorkflow::test_lithos_read_nonexistent_doc_does_not_raise tests/test_server.py::TestKnowledgeToolWorkflow::test_lithos_read_missing_id_returns_structured_error tests/test_server.py::TestKnowledgeToolWorkflow::test_lithos_read_missing_path_returns_structured_error -v 2>&1 | sed 's/[0-9]*\.[0-9]*s *(0:[0-9:]*)//g' | sed 's/ in [0-9]*\.[0-9]*s/ in Xs/g' | sed 's|-- /.*\.venv/bin/python|-- .venv/bin/python|g' | sed 's|rootdir: /.*|rootdir: .|g'
 ```
 
 ```output
 ============================= test session starts ==============================
-platform darwin -- Python 3.12.12, pytest-9.0.2, pluggy-1.6.0 -- .venv/bin/python3
+platform darwin -- Python 3.12.12, pytest-9.0.2, pluggy-1.6.0 -- .venv/bin/python
 cachedir: .pytest_cache
 rootdir: .
 configfile: pyproject.toml
