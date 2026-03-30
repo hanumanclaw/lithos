@@ -701,6 +701,11 @@ class KnowledgeManager:
                 if existing_id is not None:
                     try:
                         existing_doc, _ = await self.read(id=existing_id)
+                        logger.warning(
+                            "Duplicate URL rejected: url=%s existing_owner=%s",
+                            norm_url,
+                            existing_id,
+                        )
                         return WriteResult(
                             status="duplicate",
                             duplicate_of=DuplicateInfo(
@@ -746,6 +751,7 @@ class KnowledgeManager:
 
             # Determine file path
             slug = slugify(title)
+            logger.debug("Slug computed: title=%r slug=%s", title, slug)
             file_path = Path(path) / f"{slug}.md" if path else Path(f"{slug}.md")
             file_path, full_path = self._resolve_safe_path(file_path)
 
@@ -793,6 +799,9 @@ class KnowledgeManager:
                         self._unresolved_provenance[source_id] = set()
                     self._unresolved_provenance[source_id].add(doc_id)
                     warnings.append(f"derived_from_ids contains missing document: {source_id}")
+                    logger.warning(
+                        "Provenance resolution failed: source_id=%s not found", source_id
+                    )
 
             # Auto-resolve: check if any existing docs had unresolved refs to this new doc
             if doc_id in self._unresolved_provenance:
@@ -809,6 +818,7 @@ class KnowledgeManager:
                 path=file_path,
             )
 
+            logger.info("Document created: id=%s agent=%s title=%r", doc_id, agent, title)
             return WriteResult(status="created", document=doc, warnings=warnings)
 
     @traced("lithos.knowledge.read")
@@ -841,6 +851,7 @@ class KnowledgeManager:
 
         post = frontmatter.load(str(full_path))
         metadata = KnowledgeMetadata.from_dict(post.metadata)
+        logger.debug("Frontmatter parsed: id=%s keys=%s", metadata.id, list(post.metadata.keys()))
 
         # Extract title and content from body
         title, content = extract_title_from_content(post.content)
@@ -943,6 +954,12 @@ class KnowledgeManager:
             doc, _ = await self.read(id=id)
 
             if expected_version is not None and doc.metadata.version != expected_version:
+                logger.warning(
+                    "Version conflict: id=%s expected=%d actual=%d",
+                    id,
+                    expected_version,
+                    doc.metadata.version,
+                )
                 return WriteResult(
                     status="error",
                     error_code="version_conflict",
@@ -990,6 +1007,11 @@ class KnowledgeManager:
                     if existing_owner is not None and existing_owner != id:
                         try:
                             existing_doc, _ = await self.read(id=existing_owner)
+                            logger.warning(
+                                "Duplicate URL rejected: url=%s existing_owner=%s",
+                                new_norm,
+                                existing_owner,
+                            )
                             return WriteResult(
                                 status="duplicate",
                                 duplicate_of=DuplicateInfo(
@@ -1051,6 +1073,9 @@ class KnowledgeManager:
                             warnings.append(
                                 f"derived_from_ids contains missing document: {source_id}"
                             )
+                            logger.warning(
+                                "Provenance resolution failed: source_id=%s not found", source_id
+                            )
 
             # Handle expires_at update
             if not isinstance(expires_at, _UnsetType):
@@ -1102,6 +1127,9 @@ class KnowledgeManager:
                 path=doc.path,
             )
 
+            logger.info(
+                "Document updated: id=%s agent=%s version=%d", id, agent, doc.metadata.version
+            )
             return WriteResult(status="updated", document=doc, warnings=warnings)
 
     @traced("lithos.knowledge.delete")
@@ -1154,6 +1182,7 @@ class KnowledgeManager:
             self._id_to_title.pop(id, None)
             self._meta_cache.pop(id, None)
 
+            logger.info("Document deleted: id=%s", id)
             return True, str(file_path)
 
     async def list_all(

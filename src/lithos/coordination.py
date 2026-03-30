@@ -1,6 +1,7 @@
 """Coordination service - SQLite-based tasks, claims, agents, findings."""
 
 import contextlib
+import logging
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -11,6 +12,8 @@ import aiosqlite
 
 from lithos.config import LithosConfig, get_config
 from lithos.telemetry import lithos_metrics, traced
+
+logger = logging.getLogger(__name__)
 
 # SQL Schema
 SCHEMA = """
@@ -192,6 +195,7 @@ class CoordinationService:
 
     async def ensure_agent_known(self, agent_id: str) -> None:
         """Ensure agent is registered, auto-registering if needed."""
+        logger.debug("ensure_agent_known: agent=%s", agent_id)
         now = _format_datetime(datetime.now(timezone.utc))
         async with aiosqlite.connect(self.db_path) as db:
             # Try to update last_seen_at
@@ -373,6 +377,7 @@ class CoordinationService:
             )
             await db.commit()
 
+        logger.info("Task created: id=%s title=%r agent=%s", task_id, title, agent)
         return task_id
 
     async def get_task(self, task_id: str) -> Task | None:
@@ -484,6 +489,7 @@ class CoordinationService:
             )
 
             await db.commit()
+            logger.info("Task completed: id=%s agent=%s", task_id, agent)
             return True
 
     @traced("lithos.coordination.cancel_task")
@@ -710,7 +716,11 @@ class CoordinationService:
             )
             await db.commit()
             if cursor.rowcount == 1:
+                logger.info("Task claimed: id=%s aspect=%s agent=%s", task_id, aspect, agent)
                 return True, expires_at
+            logger.warning(
+                "Claim conflict: task_id=%s aspect=%s attempted_by=%s", task_id, aspect, agent
+            )
             return False, None
 
     async def renew_claim(
@@ -745,6 +755,9 @@ class CoordinationService:
             row = await cursor.fetchone()
 
             if not row:
+                logger.warning(
+                    "Expired claim access: task_id=%s agent=%s aspect=%s", task_id, agent, aspect
+                )
                 return False, None  # No active claim
 
             if row[0] != agent:
@@ -759,6 +772,7 @@ class CoordinationService:
                 (_format_datetime(new_expires), task_id, aspect),
             )
             await db.commit()
+            logger.debug("Claim renewed: task_id=%s agent=%s", task_id, agent)
             return True, new_expires
 
     @traced("lithos.coordination.release_claim")
@@ -815,6 +829,7 @@ class CoordinationService:
             )
             await db.commit()
 
+        logger.info("Finding posted: task_id=%s agent=%s finding_id=%s", task_id, agent, finding_id)
         return finding_id
 
     async def list_findings(
