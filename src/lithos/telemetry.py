@@ -535,6 +535,7 @@ class _LithosMetrics:
         self._search_duration: Any = None
         self._coordination_ops: Any = None
         self._event_bus_ops: Any = None
+        self._event_bus_subscriber_drops: Any = None
         self._cache_lookups: Any = None
         self._cache_lookup_duration: Any = None
         self._reconcile_ops: Any = None
@@ -599,6 +600,20 @@ class _LithosMetrics:
                 description="Event bus emit and drop operations",
             )
         return self._event_bus_ops
+
+    @property
+    def event_bus_subscriber_drops(self) -> Any:
+        """Counter incremented when a subscriber queue is full and an event is dropped.
+
+        Attributes:
+            subscriber_id: UUID identifying the subscriber whose queue was full.
+        """
+        if self._event_bus_subscriber_drops is None:
+            self._event_bus_subscriber_drops = get_meter().create_counter(
+                "lithos.event_bus.subscriber_drops",
+                description="Events dropped because a subscriber queue was full",
+            )
+        return self._event_bus_subscriber_drops
 
     @property
     def cache_lookups(self) -> Any:
@@ -700,6 +715,46 @@ def register_resource_gauges(
         callbacks=[lambda _: [Observation(int(get_agent_count()))]],
         description="Number of agents registered in the coordination store",
     )
+
+
+def register_event_bus_metrics(event_bus: Any) -> None:
+    """Register OTEL observable gauge for event bus buffer utilisation.
+
+    Registers ``lithos.event_bus.buffer_utilisation`` — an observable gauge
+    that emits one ``Observation`` per subscriber, in the range [0.0, 1.0],
+    representing the current queue fill fraction.
+
+    The gauge is per-subscriber, tagged with ``subscriber_id``.
+
+    Safe to call even if OTEL is not active — in that case it is a no-op.
+
+    Args:
+        event_bus: The ``EventBus`` instance whose subscribers to observe.
+    """
+    meter = get_meter()
+
+    if _HAS_OTEL and _initialized:
+        def _buffer_utilisation_callback(_options: Any) -> list[Any]:
+            return [
+                Observation(ratio, {"subscriber_id": sub_id})
+                for sub_id, ratio in event_bus.get_buffer_utilisation()
+            ]
+
+        meter.create_observable_gauge(
+            "lithos.event_bus.buffer_utilisation",
+            callbacks=[_buffer_utilisation_callback],
+            description=(
+                "Current fill ratio of each subscriber queue (0.0 = empty, 1.0 = full)"
+            ),
+        )
+    else:
+        meter.create_observable_gauge(
+            "lithos.event_bus.buffer_utilisation",
+            callbacks=[],
+            description=(
+                "Current fill ratio of each subscriber queue (0.0 = empty, 1.0 = full)"
+            ),
+        )
 
 
 lithos_metrics = _LithosMetrics()
