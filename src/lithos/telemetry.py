@@ -523,6 +523,71 @@ def timed_write(op: str) -> Callable[[F], F]:
     return decorator  # type: ignore[return-value]
 
 
+# --- @tool_metrics decorator ---
+
+
+def tool_metrics(
+    tool_name: str | None = None,
+) -> Callable[[F], F]:
+    """Decorator that increments per-tool call and error counters.
+
+    Increments ``lithos.tool.calls`` on every invocation and
+    ``lithos.tool.errors`` whenever the handler raises an exception.
+
+    Works for both sync and async functions. When OTEL is disabled the
+    counters are no-ops so there is no observable overhead.
+
+    Args:
+        tool_name: Explicit tool name. Defaults to ``func.__name__``.
+
+    Usage::
+
+        @self.mcp.tool()
+        @tool_metrics()
+        async def lithos_write(...):
+            ...
+
+        # Or with an explicit name:
+        @tool_metrics("lithos_search")
+        async def lithos_search(...):
+            ...
+    """
+
+    def decorator(func: F) -> F:
+        name = tool_name or func.__name__
+
+        if asyncio.iscoroutinefunction(func):
+
+            @functools.wraps(func)
+            async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
+                lithos_metrics.tool_calls.add(1, {"tool_name": name})
+                try:
+                    return await func(*args, **kwargs)
+                except Exception as exc:
+                    lithos_metrics.tool_errors.add(
+                        1, {"tool_name": name, "error_type": type(exc).__name__}
+                    )
+                    raise
+
+            return async_wrapper  # type: ignore[return-value]
+        else:
+
+            @functools.wraps(func)
+            def sync_wrapper(*args: Any, **kwargs: Any) -> Any:
+                lithos_metrics.tool_calls.add(1, {"tool_name": name})
+                try:
+                    return func(*args, **kwargs)
+                except Exception as exc:
+                    lithos_metrics.tool_errors.add(
+                        1, {"tool_name": name, "error_type": type(exc).__name__}
+                    )
+                    raise
+
+            return sync_wrapper  # type: ignore[return-value]
+
+    return decorator
+
+
 # --- Lazy metric instruments ---
 
 
@@ -542,6 +607,8 @@ class _LithosMetrics:
         self._reconcile_ops: Any = None
         self._startup_duration: Any = None
         self._file_watcher_events: Any = None
+        self._tool_calls: Any = None
+        self._tool_errors: Any = None
 
     @property
     def knowledge_ops(self) -> Any:
@@ -673,6 +740,35 @@ class _LithosMetrics:
                 description="Total file watcher events by event type",
             )
         return self._file_watcher_events
+
+    @property
+    def tool_calls(self) -> Any:
+        """Counter incremented on every MCP tool invocation.
+
+        Attributes:
+            tool_name: The name of the MCP tool (e.g. ``"lithos_write"``).
+        """
+        if self._tool_calls is None:
+            self._tool_calls = get_meter().create_counter(
+                "lithos.tool.calls",
+                description="MCP tool invocation count",
+            )
+        return self._tool_calls
+
+    @property
+    def tool_errors(self) -> Any:
+        """Counter incremented whenever a tool handler raises an exception.
+
+        Attributes:
+            tool_name:  The name of the MCP tool.
+            error_type: The exception class name (e.g. ``"ValueError"``).
+        """
+        if self._tool_errors is None:
+            self._tool_errors = get_meter().create_counter(
+                "lithos.tool.errors",
+                description="MCP tool error count",
+            )
+        return self._tool_errors
 
 
 def register_active_claims_observer(get_active_claim_count: Callable[[], int]) -> None:
