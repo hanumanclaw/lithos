@@ -223,39 +223,37 @@ class LithosServer:
                 conn_span.set_attribute(
                     "lithos.sse.event_types", ",".join(event_types) if event_types else ""
                 )
-            try:
-                # Replay buffered events if a since_id was provided
-                if since_id:
-                    with tracer.start_as_current_span("lithos.sse.replay") as replay_span:
-                        replayed = self.event_bus.get_buffered_since(since_id)
-                        replay_count = 0
-                        for evt in replayed:
-                            # Apply the same filters to replayed events
-                            if event_types and evt.type not in event_types:
-                                continue
-                            if tag_filter and not any(t in evt.tags for t in tag_filter):
-                                continue
-                            replay_count += 1
-                            yield _format_sse(evt)
-                        replay_span.set_attribute("lithos.sse.replayed", replay_count)
+                try:
+                    # Replay buffered events if a since_id was provided
+                    if since_id:
+                        with tracer.start_as_current_span("lithos.sse.replay") as replay_span:
+                            replayed = self.event_bus.get_buffered_since(since_id)
+                            replay_count = 0
+                            for evt in replayed:
+                                # Apply the same filters to replayed events
+                                if event_types and evt.type not in event_types:
+                                    continue
+                                if tag_filter and not any(t in evt.tags for t in tag_filter):
+                                    continue
+                                replay_count += 1
+                                yield _format_sse(evt)
+                            replay_span.set_attribute("lithos.sse.replayed", replay_count)
 
-                # Stream live events
-                while True:
-                    try:
-                        evt = await asyncio.wait_for(queue.get(), timeout=15.0)
-                        yield _format_sse(evt)
-                    except asyncio.TimeoutError:
-                        # Send keepalive comment to prevent proxy/firewall disconnects
-                        yield ": keepalive\n\n"
-                    except asyncio.CancelledError:
-                        break
-            except Exception:
-                logger.exception("SSE stream error")
-            finally:
-                self._sse_client_count -= 1
-                self.event_bus.unsubscribe(queue)
-                with tracer.start_as_current_span("lithos.sse.disconnect"):
-                    pass  # root span captures disconnect lifecycle
+                    # Stream live events
+                    while True:
+                        try:
+                            evt = await asyncio.wait_for(queue.get(), timeout=15.0)
+                            yield _format_sse(evt)
+                        except asyncio.TimeoutError:
+                            # Send keepalive comment to prevent proxy/firewall disconnects
+                            yield ": keepalive\n\n"
+                        except asyncio.CancelledError:
+                            break
+                except Exception:
+                    logger.exception("SSE stream error")
+                finally:
+                    self._sse_client_count -= 1
+                    self.event_bus.unsubscribe(queue)
 
         return StreamingResponse(
             _event_stream(),
@@ -273,32 +271,32 @@ class LithosServer:
             span.set_attribute("lithos.server.host", self._config.server.host)
             span.set_attribute("lithos.server.port", self._config.server.port)
 
-        # Ensure directories exist
-        self.config.ensure_directories()
+            # Ensure directories exist
+            self.config.ensure_directories()
 
-        # Initialize coordination database
-        await self.coordination.initialize()
+            # Initialize coordination database
+            await self.coordination.initialize()
 
-        # Register active claims gauge observer
-        register_active_claims_observer(lambda: self._cached_active_claims)
+            # Register active claims gauge observer
+            register_active_claims_observer(lambda: self._cached_active_claims)
 
-        # Load or build indices.
-        # Force access to the tantivy property so schema version check runs.
-        tantivy_needs_rebuild = self.search.tantivy.needs_rebuild
-        if self.config.index.rebuild_on_start or tantivy_needs_rebuild:
-            await self._rebuild_indices()
-        else:
-            # Try to load cached graph
-            if not self.graph.load_cache():
+            # Load or build indices.
+            # Force access to the tantivy property so schema version check runs.
+            tantivy_needs_rebuild = self.search.tantivy.needs_rebuild
+            if self.config.index.rebuild_on_start or tantivy_needs_rebuild:
                 await self._rebuild_indices()
+            else:
+                # Try to load cached graph
+                if not self.graph.load_cache():
+                    await self._rebuild_indices()
 
-        # Pre-warm the embedding model in the background so the first real
-        # request does not block the event loop.  Skip if the rebuild path
-        # already loaded it synchronously.
-        if self.search.chroma._model is None:
-            task = asyncio.create_task(self._prewarm_embeddings())
-            self._background_tasks.add(task)
-            task.add_done_callback(self._background_tasks.discard)
+            # Pre-warm the embedding model in the background so the first real
+            # request does not block the event loop.  Skip if the rebuild path
+            # already loaded it synchronously.
+            if self.search.chroma._model is None:
+                task = asyncio.create_task(self._prewarm_embeddings())
+                self._background_tasks.add(task)
+                task.add_done_callback(self._background_tasks.discard)
 
     async def _prewarm_embeddings(self) -> None:
         """Pre-warm the embedding model, logging errors instead of crashing."""
