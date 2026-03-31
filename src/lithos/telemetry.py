@@ -538,6 +538,8 @@ class _LithosMetrics:
         self._cache_lookups: Any = None
         self._cache_lookup_duration: Any = None
         self._reconcile_ops: Any = None
+        self._startup_duration: Any = None
+        self._file_watcher_events: Any = None
 
     @property
     def knowledge_ops(self) -> Any:
@@ -626,6 +628,35 @@ class _LithosMetrics:
                 description="Reconcile scope operations by scope and status",
             )
         return self._reconcile_ops
+
+    @property
+    def startup_duration(self) -> Any:
+        """Histogram tracking server startup duration in milliseconds.
+
+        Recorded once per process startup, from the start of ``initialize()``
+        to the point when all components are ready.
+        """
+        if self._startup_duration is None:
+            self._startup_duration = get_meter().create_histogram(
+                "lithos.startup_duration_ms",
+                description="Server startup duration from initialize() start to ready",
+                unit="ms",
+            )
+        return self._startup_duration
+
+    @property
+    def file_watcher_events(self) -> Any:
+        """Counter tracking file watcher events by event type.
+
+        Attributes:
+            event_type: "created" | "updated" | "deleted"
+        """
+        if self._file_watcher_events is None:
+            self._file_watcher_events = get_meter().create_counter(
+                "lithos.file_watcher.events_total",
+                description="Total file watcher events by event type",
+            )
+        return self._file_watcher_events
 
 
 def register_active_claims_observer(get_active_claim_count: Callable[[], int]) -> None:

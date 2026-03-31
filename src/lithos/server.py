@@ -357,6 +357,9 @@ class LithosServer:
 
     async def initialize(self) -> None:
         """Initialize all components."""
+        import time as _time
+
+        _init_start = _time.perf_counter()
         tracer = get_tracer()
         with tracer.start_as_current_span("lithos.server.initialize") as span:
             span.set_attribute("lithos.server.host", self._config.server.host)
@@ -400,6 +403,11 @@ class LithosServer:
                     task = asyncio.create_task(self._prewarm_embeddings())
                     self._background_tasks.add(task)
                     task.add_done_callback(self._background_tasks.discard)
+
+                # Record startup duration now that all components are ready.
+                elapsed_ms = (_time.perf_counter() - _init_start) * 1000
+                lithos_metrics.startup_duration.record(elapsed_ms)
+                span.set_attribute("lithos.startup_duration_ms", elapsed_ms)
             except Exception as exc:
                 span.record_exception(exc)
                 span.set_status(StatusCode.ERROR, str(exc))
@@ -567,6 +575,9 @@ class LithosServer:
                             self.graph.remove_document(doc_id)
                             self.graph.save_cache()
 
+                            lithos_metrics.file_watcher_events.add(
+                                1, {"event_type": "deleted"}
+                            )
                             await self._emit(
                                 LithosEvent(
                                     type=NOTE_DELETED,
@@ -574,11 +585,16 @@ class LithosServer:
                                 )
                             )
                     else:
+                        is_new = not self.knowledge.get_id_by_path(relative_path)
                         doc = await self.knowledge.sync_from_disk(relative_path)
                         self.search.index_document(doc)
                         self.graph.add_document(doc)
                         self.graph.save_cache()
 
+                        event_type = "created" if is_new else "updated"
+                        lithos_metrics.file_watcher_events.add(
+                            1, {"event_type": event_type}
+                        )
                         await self._emit(
                             LithosEvent(
                                 type=NOTE_UPDATED,
