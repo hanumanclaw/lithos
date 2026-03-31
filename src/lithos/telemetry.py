@@ -37,10 +37,18 @@ try:
         ConsoleSpanExporter,
         SimpleSpanProcessor,
     )
+    from opentelemetry.trace import StatusCode  # type: ignore[assignment]
 
     _HAS_OTEL = True
 except ImportError:
     _HAS_OTEL = False
+
+    class StatusCode:  # type: ignore[no-redef]
+        """No-op StatusCode stub used when opentelemetry-api is not installed."""
+
+        ERROR = "ERROR"
+        OK = "OK"
+        UNSET = "UNSET"
 
 
 # --- Module state ---

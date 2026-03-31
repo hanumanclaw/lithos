@@ -37,7 +37,7 @@ from lithos.events import (
 from lithos.graph import KnowledgeGraph
 from lithos.knowledge import _UNSET, KnowledgeManager, _UnsetType
 from lithos.search import SearchEngine
-from lithos.telemetry import get_tracer, lithos_metrics, register_active_claims_observer
+from lithos.telemetry import StatusCode, get_tracer, lithos_metrics, register_active_claims_observer
 
 logger = logging.getLogger(__name__)
 
@@ -217,33 +217,45 @@ class LithosServer:
         self._sse_client_count += 1
 
         async def _event_stream():
-            try:
-                # Replay buffered events if a since_id was provided
-                if since_id:
-                    replayed = self.event_bus.get_buffered_since(since_id)
-                    for evt in replayed:
-                        # Apply the same filters to replayed events
-                        if event_types and evt.type not in event_types:
-                            continue
-                        if tag_filter and not any(t in evt.tags for t in tag_filter):
-                            continue
-                        yield _format_sse(evt)
+            tracer = get_tracer()
+            with tracer.start_as_current_span("lithos.sse.connect") as conn_span:
+                conn_span.set_attribute("lithos.sse.since_id", since_id or "")
+                conn_span.set_attribute(
+                    "lithos.sse.event_types", ",".join(event_types) if event_types else ""
+                )
+                try:
+                    # Replay buffered events if a since_id was provided
+                    if since_id:
+                        with tracer.start_as_current_span("lithos.sse.replay") as replay_span:
+                            replayed = self.event_bus.get_buffered_since(since_id)
+                            replay_count = 0
+                            for evt in replayed:
+                                # Apply the same filters to replayed events
+                                if event_types and evt.type not in event_types:
+                                    continue
+                                if tag_filter and not any(t in evt.tags for t in tag_filter):
+                                    continue
+                                replay_count += 1
+                                yield _format_sse(evt)
+                            replay_span.set_attribute("lithos.sse.replayed", replay_count)
 
-                # Stream live events
-                while True:
-                    try:
-                        evt = await asyncio.wait_for(queue.get(), timeout=15.0)
-                        yield _format_sse(evt)
-                    except asyncio.TimeoutError:
-                        # Send keepalive comment to prevent proxy/firewall disconnects
-                        yield ": keepalive\n\n"
-                    except asyncio.CancelledError:
-                        break
-            except Exception:
-                logger.exception("SSE stream error")
-            finally:
-                self._sse_client_count -= 1
-                self.event_bus.unsubscribe(queue)
+                    # Stream live events
+                    while True:
+                        try:
+                            evt = await asyncio.wait_for(queue.get(), timeout=15.0)
+                            yield _format_sse(evt)
+                        except asyncio.TimeoutError:
+                            # Send keepalive comment to prevent proxy/firewall disconnects
+                            yield ": keepalive\n\n"
+                        except asyncio.CancelledError:
+                            break
+                except Exception as exc:
+                    conn_span.record_exception(exc)
+                    conn_span.set_status(StatusCode.ERROR, str(exc))
+                    logger.exception("SSE stream error")
+                finally:
+                    self._sse_client_count -= 1
+                    self.event_bus.unsubscribe(queue)
 
         return StreamingResponse(
             _event_stream(),
@@ -256,39 +268,53 @@ class LithosServer:
 
     async def initialize(self) -> None:
         """Initialize all components."""
-        # Ensure directories exist
-        self.config.ensure_directories()
+        tracer = get_tracer()
+        with tracer.start_as_current_span("lithos.server.initialize") as span:
+            span.set_attribute("lithos.server.host", self._config.server.host)
+            span.set_attribute("lithos.server.port", self._config.server.port)
 
-        # Initialize coordination database
-        await self.coordination.initialize()
+            try:
+                # Ensure directories exist
+                self.config.ensure_directories()
 
-        # Register active claims gauge observer
-        register_active_claims_observer(lambda: self._cached_active_claims)
+                # Initialize coordination database
+                await self.coordination.initialize()
 
-        # Load or build indices.
-        # Force access to the tantivy property so schema version check runs.
-        tantivy_needs_rebuild = self.search.tantivy.needs_rebuild
-        if self.config.index.rebuild_on_start or tantivy_needs_rebuild:
-            await self._rebuild_indices()
-        else:
-            # Try to load cached graph
-            if not self.graph.load_cache():
-                await self._rebuild_indices()
+                # Register active claims gauge observer
+                register_active_claims_observer(lambda: self._cached_active_claims)
 
-        # Pre-warm the embedding model in the background so the first real
-        # request does not block the event loop.  Skip if the rebuild path
-        # already loaded it synchronously.
-        if self.search.chroma._model is None:
-            task = asyncio.create_task(self._prewarm_embeddings())
-            self._background_tasks.add(task)
-            task.add_done_callback(self._background_tasks.discard)
+                # Load or build indices.
+                # Force access to the tantivy property so schema version check runs.
+                tantivy_needs_rebuild = self.search.tantivy.needs_rebuild
+                if self.config.index.rebuild_on_start or tantivy_needs_rebuild:
+                    await self._rebuild_indices()
+                else:
+                    # Try to load cached graph
+                    if not self.graph.load_cache():
+                        await self._rebuild_indices()
+
+                # Pre-warm the embedding model in the background so the first real
+                # request does not block the event loop.  Skip if the rebuild path
+                # already loaded it synchronously.
+                if self.search.chroma._model is None:
+                    task = asyncio.create_task(self._prewarm_embeddings())
+                    self._background_tasks.add(task)
+                    task.add_done_callback(self._background_tasks.discard)
+            except Exception as exc:
+                span.record_exception(exc)
+                span.set_status(StatusCode.ERROR, str(exc))
+                raise
 
     async def _prewarm_embeddings(self) -> None:
         """Pre-warm the embedding model, logging errors instead of crashing."""
-        try:
-            await self.search.ensure_embeddings_loaded()
-        except Exception:
-            logger.warning("Background embedding model pre-warm failed", exc_info=True)
+        tracer = get_tracer()
+        with tracer.start_as_current_span("lithos.embeddings.prewarm") as span:
+            try:
+                await self.search.ensure_embeddings_loaded()
+                span.set_attribute("lithos.embeddings.status", "ok")
+            except Exception:
+                span.set_attribute("lithos.embeddings.status", "failed")
+                logger.warning("Background embedding model pre-warm failed", exc_info=True)
 
     async def _rebuild_indices(self) -> None:
         """Rebuild all search indices from files."""
