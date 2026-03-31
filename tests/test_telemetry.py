@@ -477,6 +477,7 @@ class TestTracingCoverage:
             "CoordinationService.list_findings is missing @traced"
         )
 
+
 class TestTraceLogCorrelation:
     """Tests for trace_id/span_id injection into log records (issue #90)."""
 
@@ -498,6 +499,7 @@ class TestTraceLogCorrelation:
         assert result is True
         assert record.otelTraceID == "0" * 32
         assert record.otelSpanID == "0" * 16
+        assert record.otelTraceSampled is False
         assert record.otelServiceName == "lithos"
 
     def test_inject_trace_context_is_idempotent(self):
@@ -590,4 +592,84 @@ class TestTraceLogCorrelation:
                 "setup_telemetry should install _TraceContextFilter"
             )
         finally:
+            _reset_for_testing()
+
+    def test_globally_installed_filter_injects_trace_context(self, test_config):
+        """End-to-end: globally-installed filter (via setup_telemetry) injects real trace IDs."""
+        pytest.importorskip("opentelemetry.sdk.trace.export.in_memory_span_exporter")
+        from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
+        import lithos.telemetry as tel
+        from lithos.telemetry import (
+            _reset_for_testing,
+            get_tracer,
+            setup_telemetry,
+            shutdown_telemetry,
+        )
+
+        _reset_for_testing()
+        test_config.telemetry.enabled = True
+        test_config.telemetry.service_name = "my-test-service"
+        setup_telemetry(test_config, _test_span_exporter=InMemorySpanExporter())
+
+        # Retrieve the globally-installed filter (not a fresh instance)
+        installed_filter = tel._trace_context_filter
+        assert installed_filter is not None, "Filter must be installed after setup_telemetry()"
+
+        tracer = get_tracer()
+        record = logging.LogRecord(
+            name="test",
+            level=logging.INFO,
+            pathname="",
+            lineno=0,
+            msg="e2e-test",
+            args=(),
+            exc_info=None,
+        )
+        try:
+            with tracer.start_as_current_span("e2e-span"):
+                installed_filter.filter(record)
+
+            # Inside the span, real trace context must be injected
+            assert record.otelTraceID != "0" * 32, "Expected non-zero trace ID within span"
+            assert len(record.otelTraceID) == 32
+            assert record.otelSpanID != "0" * 16, "Expected non-zero span ID within span"
+            assert len(record.otelSpanID) == 16
+            assert record.otelTraceSampled is True
+            assert record.otelServiceName == "my-test-service"
+        finally:
+            shutdown_telemetry()
+            _reset_for_testing()
+
+    def test_filter_uses_configured_service_name(self, test_config):
+        """_TraceContextFilter uses the service_name passed at construction, not a hardcoded value."""
+        pytest.importorskip("opentelemetry.sdk.trace.export.in_memory_span_exporter")
+        from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
+        import lithos.telemetry as tel
+        from lithos.telemetry import _reset_for_testing, setup_telemetry, shutdown_telemetry
+
+        _reset_for_testing()
+        test_config.telemetry.enabled = True
+        test_config.telemetry.service_name = "custom-svc"
+        try:
+            setup_telemetry(test_config, _test_span_exporter=InMemorySpanExporter())
+            installed_filter = tel._trace_context_filter
+            assert installed_filter is not None
+
+            record = logging.LogRecord(
+                name="test",
+                level=logging.INFO,
+                pathname="",
+                lineno=0,
+                msg="svc-name-test",
+                args=(),
+                exc_info=None,
+            )
+            installed_filter.filter(record)
+            assert record.otelServiceName == "custom-svc", (
+                f"Expected 'custom-svc', got '{record.otelServiceName}'"
+            )
+        finally:
+            shutdown_telemetry()
             _reset_for_testing()
