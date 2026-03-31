@@ -236,8 +236,12 @@ class KnowledgeGraph:
             doc: The newly added document
         """
         # Possible targets that could match this document
+        # TODO: slug formula doesn't strip punctuation — pre-existing behaviour
         title_slug = doc.title.lower().replace(" ", "-")
-        logger.debug("computing slug for pending-link resolution: title=%r slug=%r", doc.title, title_slug)
+        # Fires on every document add; intentional for DEBUG-level tracing
+        logger.debug(
+            "computing slug for pending-link resolution: title=%r slug=%r", doc.title, title_slug
+        )
         possible_targets = [
             doc.path.stem,  # filename without extension
             str(doc.path),  # full path
@@ -303,13 +307,13 @@ class KnowledgeGraph:
         path_target = target if target.endswith(".md") else f"{target}.md"
         if path_target in self._path_to_node:
             resolved = self._path_to_node[path_target]
-            logger.debug("resolving link %r → %r (path match)", target, resolved)
+            logger.debug("resolving link %r → %r (path match, .md-normalised)", target, resolved)
             return resolved
 
         # Also try without .md for paths that might include it
         if target in self._path_to_node:
             resolved = self._path_to_node[target]
-            logger.debug("resolving link %r → %r (path match)", target, resolved)
+            logger.debug("resolving link %r → %r (path match, verbatim)", target, resolved)
             return resolved
 
         # 2. Filename match
@@ -322,7 +326,9 @@ class KnowledgeGraph:
                 logger.debug("resolving link %r → %r (filename match)", target, nodes[0])
                 return nodes[0]
             # Ambiguous - return None (could raise error)
-            logger.debug("resolving link %r → None (ambiguous filename: %d matches)", target, len(nodes))
+            logger.debug(
+                "resolving link %r → None (ambiguous filename: %d matches)", target, len(nodes)
+            )
             return None
 
         # 3. UUID match
