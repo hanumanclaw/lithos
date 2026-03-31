@@ -162,6 +162,18 @@ class LithosServer:
             agent_id: Filter entries to this agent (optional).
             after: ISO-8601 timestamp; only entries after this time (optional).
             limit: Max entries to return (default: 100, max: 1000).
+            doc_id: Filter entries for a specific document (optional).
+
+        .. note::
+            ``agent_id`` in log entries is self-reported by callers and spoofable;
+            the audit log is advisory-only and must not be used for access control.
+
+        .. warning:: SECURITY: Trust boundary
+            This endpoint is **unauthenticated** and exposes the full agent access
+            history to anyone with HTTP access to this server. It is suitable only
+            for trusted-network deployments (e.g. localhost or a private LAN). When
+            Lithos adds an authentication layer, this endpoint MUST be gated behind
+            it.
         """
         from starlette.responses import JSONResponse
 
@@ -802,14 +814,13 @@ class LithosServer:
                         "message": str(e),
                     }
 
-                # Audit log — fire-and-forget, never blocks the response
+                # Audit log — awaited here so the current read is committed before
+                # we query the retrieval count (avoids TOCTOU off-by-one).
                 audit_agent = agent_id or "unknown"
-                asyncio.ensure_future(  # noqa: RUF006
-                    self.coordination.log_access(
-                        doc_id=doc.id,
-                        operation="read",
-                        agent_id=audit_agent,
-                    )
+                await self.coordination.log_access(
+                    doc_id=doc.id,
+                    operation="read",
+                    agent_id=audit_agent,
                 )
 
                 # Retrieval count — how many times this doc has been read
@@ -1015,16 +1026,17 @@ class LithosServer:
                 span.set_attribute("lithos.result_count", len(results_payload))
                 logger.info("lithos_search mode=%s results=%d", mode, len(results_payload))
 
-                # Audit log every returned document — fire-and-forget
+                # Audit log every returned document in a single batch write — fire-and-forget.
+                # Using log_access_batch avoids N concurrent SQLite connections (previously
+                # one asyncio.ensure_future per result document).
                 audit_agent = agent_id or "unknown"
-                for result in results_payload:
-                    asyncio.ensure_future(  # noqa: RUF006
-                        self.coordination.log_access(
-                            doc_id=result["id"],
-                            operation="search_result",
-                            agent_id=audit_agent,
-                        )
+                asyncio.ensure_future(  # noqa: RUF006
+                    self.coordination.log_access_batch(
+                        doc_ids=[r["id"] for r in results_payload],
+                        operation="search_result",
+                        agent_id=audit_agent,
                     )
+                )
 
                 return {"results": results_payload}
 

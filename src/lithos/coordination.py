@@ -76,6 +76,7 @@ CREATE INDEX IF NOT EXISTS idx_claims_task_id ON claims(task_id);
 CREATE INDEX IF NOT EXISTS idx_claims_expires_at ON claims(expires_at);
 CREATE INDEX IF NOT EXISTS idx_findings_task_id ON findings(task_id);
 CREATE INDEX IF NOT EXISTS idx_access_log_agent_id ON access_log(agent_id);
+CREATE INDEX IF NOT EXISTS idx_access_log_doc_id ON access_log(doc_id);
 CREATE INDEX IF NOT EXISTS idx_access_log_timestamp ON access_log(timestamp);
 """
 
@@ -940,6 +941,40 @@ class CoordinationService:
                 await db.commit()
         except Exception:
             logger.debug("audit log_access failed (non-fatal)", exc_info=True)
+
+    async def log_access_batch(
+        self,
+        doc_ids: list[str],
+        operation: Literal["read", "search_result"],
+        agent_id: str = "unknown",
+    ) -> None:
+        """Append multiple read-access entries to the audit log in a single write.
+
+        Prefer this over calling :meth:`log_access` in a loop for bulk operations
+        (e.g. search results) to avoid opening N concurrent SQLite connections.
+
+        Failures are swallowed — audit logging must never degrade the hot path.
+
+        Args:
+            doc_ids: Documents that were accessed.
+            operation: ``"read"`` or ``"search_result"``.
+            agent_id: The agent that triggered the access (default: ``"unknown"``).
+                      Note: ``agent_id`` is self-reported and spoofable; the audit
+                      log is advisory-only and should not be used for access control.
+        """
+        if not doc_ids:
+            return
+        now = _format_datetime(datetime.now(timezone.utc))
+        rows = [(agent_id, doc_id, operation, now) for doc_id in doc_ids]
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                await db.executemany(
+                    "INSERT INTO access_log (agent_id, doc_id, operation, timestamp) VALUES (?, ?, ?, ?)",
+                    rows,
+                )
+                await db.commit()
+        except Exception:
+            logger.debug("audit log_access_batch failed (non-fatal)", exc_info=True)
 
     async def get_audit_log(
         self,
