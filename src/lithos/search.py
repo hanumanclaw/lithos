@@ -591,7 +591,7 @@ class ChromaIndex:
 
         # Prepare data for ChromaDB
         ids = [self._chunk_id(doc.id, i) for i in range(len(chunks))]
-        metadatas = [
+        metadatas: list[chromadb.Metadata] = [
             {
                 "doc_id": doc.id,
                 "chunk_index": i,
@@ -615,7 +615,7 @@ class ChromaIndex:
             ids=ids,
             embeddings=embeddings,
             documents=chunks,
-            metadatas=metadatas,  # type: ignore[arg-type]
+            metadatas=metadatas,
         )
 
         return len(chunks)
