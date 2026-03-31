@@ -54,6 +54,7 @@ except ImportError:
 # --- Module state ---
 
 _initialized = False
+_event_bus_metrics_registered = False
 _tracer_provider: Any = None  # TracerProvider when active
 _meter_provider: Any = None  # MeterProvider when active
 _log_provider: Any = None  # LoggerProvider when active
@@ -715,9 +716,6 @@ def register_resource_gauges(
         callbacks=[lambda _: [Observation(int(get_agent_count()))]],
         description="Number of agents registered in the coordination store",
     )
-
-
-_event_bus_metrics_registered: bool = False
 
 
 def register_event_bus_metrics(event_bus: Any) -> None:
