@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import logging
 from typing import Any
 
 import pytest
@@ -475,3 +476,118 @@ class TestTracingCoverage:
         assert hasattr(CoordinationService.list_findings, "__wrapped__"), (
             "CoordinationService.list_findings is missing @traced"
         )
+
+class TestTraceLogCorrelation:
+    """Tests for trace_id/span_id injection into log records (issue #90)."""
+
+    def test_filter_adds_fields_when_inactive(self):
+        """_TraceContextFilter adds otelTraceID=zeros when OTEL is inactive."""
+        from lithos.telemetry import _TraceContextFilter
+
+        flt = _TraceContextFilter()
+        record = logging.LogRecord(
+            name="test",
+            level=logging.INFO,
+            pathname="",
+            lineno=0,
+            msg="hello",
+            args=(),
+            exc_info=None,
+        )
+        result = flt.filter(record)
+        assert result is True
+        assert record.otelTraceID == "0" * 32
+        assert record.otelSpanID == "0" * 16
+        assert record.otelServiceName == "lithos"
+
+    def test_inject_trace_context_is_idempotent(self):
+        """_inject_trace_context_into_logs() does not install the filter twice."""
+        from lithos.telemetry import _inject_trace_context_into_logs, _reset_for_testing
+
+        _reset_for_testing()
+        _inject_trace_context_into_logs()
+        _inject_trace_context_into_logs()  # second call must be a no-op
+
+        root = logging.getLogger()
+        count = sum(1 for f in root.filters if f.__class__.__name__ == "_TraceContextFilter")
+        assert count == 1
+
+        # Cleanup
+        _reset_for_testing()
+
+    def test_filter_removed_on_reset(self):
+        """_reset_for_testing() removes the filter from the root logger."""
+        from lithos.telemetry import _inject_trace_context_into_logs, _reset_for_testing
+
+        _reset_for_testing()
+        _inject_trace_context_into_logs()
+
+        root = logging.getLogger()
+        before = sum(1 for f in root.filters if f.__class__.__name__ == "_TraceContextFilter")
+        assert before == 1
+
+        _reset_for_testing()
+        after = sum(1 for f in root.filters if f.__class__.__name__ == "_TraceContextFilter")
+        assert after == 0
+
+    def test_trace_id_injected_within_active_span(self, test_config):
+        """When inside a span, otelTraceID is a non-zero hex string."""
+        pytest.importorskip("opentelemetry.sdk.trace.export.in_memory_span_exporter")
+        from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
+        from lithos.telemetry import (
+            _reset_for_testing,
+            _TraceContextFilter,
+            get_tracer,
+            setup_telemetry,
+            shutdown_telemetry,
+        )
+
+        _reset_for_testing()
+        test_config.telemetry.enabled = True
+        setup_telemetry(test_config, _test_span_exporter=InMemorySpanExporter())
+
+        flt = _TraceContextFilter()
+        tracer = get_tracer()
+
+        try:
+            record = logging.LogRecord(
+                name="test",
+                level=logging.INFO,
+                pathname="",
+                lineno=0,
+                msg="in-span",
+                args=(),
+                exc_info=None,
+            )
+            with tracer.start_as_current_span("test-span"):
+                flt.filter(record)
+
+            # Inside a span the trace ID must be non-zero
+            assert record.otelTraceID != "0" * 32
+            assert len(record.otelTraceID) == 32
+            assert record.otelSpanID != "0" * 16
+            assert len(record.otelSpanID) == 16
+        finally:
+            shutdown_telemetry()
+            _reset_for_testing()
+
+    def test_setup_telemetry_installs_filter(self, test_config):
+        """setup_telemetry() always installs _TraceContextFilter on the root logger."""
+        pytest.importorskip("opentelemetry.sdk.trace.export.in_memory_span_exporter")
+        from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
+        from lithos.telemetry import _reset_for_testing, setup_telemetry
+
+        _reset_for_testing()
+        test_config.telemetry.enabled = True
+        try:
+            exporter = InMemorySpanExporter()
+            setup_telemetry(test_config, _test_span_exporter=exporter)
+
+            root = logging.getLogger()
+            assert any(f.__class__.__name__ == "_TraceContextFilter" for f in root.filters), (
+                "setup_telemetry should install _TraceContextFilter"
+            )
+        finally:
+            _reset_for_testing()
