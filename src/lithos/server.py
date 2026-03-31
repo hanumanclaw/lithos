@@ -37,7 +37,7 @@ from lithos.events import (
 from lithos.graph import KnowledgeGraph
 from lithos.knowledge import _UNSET, KnowledgeManager, _UnsetType
 from lithos.search import SearchEngine
-from lithos.telemetry import get_tracer, lithos_metrics, register_active_claims_observer
+from lithos.telemetry import StatusCode, get_tracer, lithos_metrics, register_active_claims_observer
 
 logger = logging.getLogger(__name__)
 
@@ -249,7 +249,9 @@ class LithosServer:
                             yield ": keepalive\n\n"
                         except asyncio.CancelledError:
                             break
-                except Exception:
+                except Exception as exc:
+                    conn_span.record_exception(exc)
+                    conn_span.set_status(StatusCode.ERROR, str(exc))
                     logger.exception("SSE stream error")
                 finally:
                     self._sse_client_count -= 1
@@ -271,32 +273,37 @@ class LithosServer:
             span.set_attribute("lithos.server.host", self._config.server.host)
             span.set_attribute("lithos.server.port", self._config.server.port)
 
-            # Ensure directories exist
-            self.config.ensure_directories()
+            try:
+                # Ensure directories exist
+                self.config.ensure_directories()
 
-            # Initialize coordination database
-            await self.coordination.initialize()
+                # Initialize coordination database
+                await self.coordination.initialize()
 
-            # Register active claims gauge observer
-            register_active_claims_observer(lambda: self._cached_active_claims)
+                # Register active claims gauge observer
+                register_active_claims_observer(lambda: self._cached_active_claims)
 
-            # Load or build indices.
-            # Force access to the tantivy property so schema version check runs.
-            tantivy_needs_rebuild = self.search.tantivy.needs_rebuild
-            if self.config.index.rebuild_on_start or tantivy_needs_rebuild:
-                await self._rebuild_indices()
-            else:
-                # Try to load cached graph
-                if not self.graph.load_cache():
+                # Load or build indices.
+                # Force access to the tantivy property so schema version check runs.
+                tantivy_needs_rebuild = self.search.tantivy.needs_rebuild
+                if self.config.index.rebuild_on_start or tantivy_needs_rebuild:
                     await self._rebuild_indices()
+                else:
+                    # Try to load cached graph
+                    if not self.graph.load_cache():
+                        await self._rebuild_indices()
 
-            # Pre-warm the embedding model in the background so the first real
-            # request does not block the event loop.  Skip if the rebuild path
-            # already loaded it synchronously.
-            if self.search.chroma._model is None:
-                task = asyncio.create_task(self._prewarm_embeddings())
-                self._background_tasks.add(task)
-                task.add_done_callback(self._background_tasks.discard)
+                # Pre-warm the embedding model in the background so the first real
+                # request does not block the event loop.  Skip if the rebuild path
+                # already loaded it synchronously.
+                if self.search.chroma._model is None:
+                    task = asyncio.create_task(self._prewarm_embeddings())
+                    self._background_tasks.add(task)
+                    task.add_done_callback(self._background_tasks.discard)
+            except Exception as exc:
+                span.record_exception(exc)
+                span.set_status(StatusCode.ERROR, str(exc))
+                raise
 
     async def _prewarm_embeddings(self) -> None:
         """Pre-warm the embedding model, logging errors instead of crashing."""

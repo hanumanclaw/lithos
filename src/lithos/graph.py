@@ -13,7 +13,7 @@ import networkx as nx
 
 from lithos.config import LithosConfig, get_config
 from lithos.knowledge import KnowledgeDocument
-from lithos.telemetry import traced
+from lithos.telemetry import StatusCode, get_tracer, traced
 
 logger = logging.getLogger(__name__)
 
@@ -380,8 +380,6 @@ class KnowledgeGraph:
         Returns:
             List of linked documents (deduplicated)
         """
-        from lithos.telemetry import get_tracer
-
         tracer = get_tracer()
         direction = "outgoing" if forward else "incoming"
         with tracer.start_as_current_span("lithos.graph.bfs_traversal") as span:
@@ -389,43 +387,48 @@ class KnowledgeGraph:
             span.set_attribute("lithos.graph.depth", depth)
             span.set_attribute("lithos.graph.direction", direction)
 
-            visited: set[str] = {start_node}
-            current_level: set[str] = {start_node}
-            result: list[LinkedDocument] = []
+            try:
+                visited: set[str] = {start_node}
+                current_level: set[str] = {start_node}
+                result: list[LinkedDocument] = []
 
-            for _ in range(depth):
-                next_level: set[str] = set()
-                for node in current_level:
-                    if forward:
-                        neighbors = self.graph.successors(node)
-                    else:
-                        neighbors = self.graph.predecessors(node)
+                for _ in range(depth):
+                    next_level: set[str] = set()
+                    for node in current_level:
+                        if forward:
+                            neighbors = self.graph.successors(node)
+                        else:
+                            neighbors = self.graph.predecessors(node)
 
-                    for neighbor in neighbors:
-                        if neighbor not in visited:
-                            visited.add(neighbor)
-                            next_level.add(neighbor)
+                        for neighbor in neighbors:
+                            if neighbor not in visited:
+                                visited.add(neighbor)
+                                next_level.add(neighbor)
 
-                            # Skip unresolved placeholder nodes
-                            if neighbor.startswith("__unresolved__"):
-                                continue
+                                # Skip unresolved placeholder nodes
+                                if neighbor.startswith("__unresolved__"):
+                                    continue
 
-                            node_data = self.graph.nodes.get(neighbor, {})
-                            if not node_data.get("unresolved"):
-                                result.append(
-                                    LinkedDocument(
-                                        id=neighbor,
-                                        title=node_data.get("title", ""),
+                                node_data = self.graph.nodes.get(neighbor, {})
+                                if not node_data.get("unresolved"):
+                                    result.append(
+                                        LinkedDocument(
+                                            id=neighbor,
+                                            title=node_data.get("title", ""),
+                                        )
                                     )
-                                )
 
-                current_level = next_level
-                if not current_level:
-                    break
+                    current_level = next_level
+                    if not current_level:
+                        break
 
-            span.set_attribute("lithos.graph.nodes_visited", len(visited))
-            span.set_attribute("lithos.graph.results_count", len(result))
-            return result
+                span.set_attribute("lithos.graph.nodes_visited", len(visited))
+                span.set_attribute("lithos.graph.results_count", len(result))
+                return result
+            except Exception as exc:
+                span.record_exception(exc)
+                span.set_status(StatusCode.ERROR, str(exc))
+                raise
 
     def get_broken_links(self) -> list[tuple[str, str, str]]:
         """Get all broken/unresolved links.
