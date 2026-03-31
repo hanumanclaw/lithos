@@ -393,7 +393,7 @@ class KnowledgeGraph:
             current_level: set[str] = {start_node}
             result: list[LinkedDocument] = []
 
-            for hop in range(depth):
+            for _ in range(depth):
                 next_level: set[str] = set()
                 for node in current_level:
                     if forward:
@@ -422,7 +422,6 @@ class KnowledgeGraph:
                 current_level = next_level
                 if not current_level:
                     break
-                _ = hop  # used by range()
 
             span.set_attribute("lithos.graph.nodes_visited", len(visited))
             span.set_attribute("lithos.graph.results_count", len(result))
