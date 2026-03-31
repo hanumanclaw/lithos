@@ -26,6 +26,8 @@ if TYPE_CHECKING:
     from chromadb.api import ClientAPI
     from numpy.typing import NDArray
 
+    from lithos.graph import KnowledgeGraph
+
 logger = logging.getLogger(__name__)
 
 
@@ -1086,6 +1088,173 @@ class SearchEngine:
         return {
             "chunks": self.chroma.count_chunks(),
         }
+
+    @traced("lithos.search.graph")
+    def graph_search(
+        self,
+        query: str,
+        graph: KnowledgeGraph,
+        seed_ids: list[str] | None = None,
+        depth: int = 2,
+        limit: int = 10,
+        fuse_semantic: bool = True,
+    ) -> list[SearchResult]:
+        """Graph-traversal search using wiki-link topology.
+
+        Standalone mode — does NOT affect hybrid/fulltext/semantic modes.
+
+        Steps:
+        1. If *seed_ids* are not provided, run a fast hybrid search to find seeds.
+        2. BFS-traverse the wiki-link graph up to *depth* hops from every seed.
+        3. Rank candidate documents by fusing three signals via RRF:
+           - PageRank centrality on the induced subgraph
+           - Semantic similarity to *query* (ChromaDB)
+           - Proximity (fewer hops from a seed = better)
+        4. Return the top-*limit* results as :class:`SearchResult` objects.
+
+        Args:
+            query: Natural language search query.
+            graph: The :class:`~lithos.graph.KnowledgeGraph` to traverse.
+            seed_ids: Starting document IDs.  If *None*, discovered via hybrid
+                      search on *query*.
+            depth: BFS hop depth (clamped to 1-3).
+            limit: Maximum number of results to return.
+            fuse_semantic: Whether to include semantic similarity as a ranking
+                           signal.  Set to *False* in unit tests to avoid
+                           loading the embedding model.
+
+        Returns:
+            Ranked list of :class:`SearchResult` objects.
+        """
+        import networkx as nx
+
+        start = time.perf_counter()
+        success = True
+        try:
+            depth = max(1, min(3, depth))
+
+            # ── Step 1: resolve seeds ────────────────────────────────────────
+            effective_seeds: list[str] = list(seed_ids) if seed_ids else []
+            if not effective_seeds:
+                try:
+                    hybrid_hits = self.hybrid_search(query, limit=5)
+                    effective_seeds = [r.id for r in hybrid_hits]
+                except Exception:
+                    logger.warning("graph_search: hybrid seed discovery failed", exc_info=True)
+
+            if not effective_seeds:
+                return []
+
+            # ── Step 2: BFS traversal ────────────────────────────────────────
+            visited: set[str] = set()
+            hop_distance: dict[str, int] = {}
+
+            queue: list[tuple[str, int]] = [(sid, 0) for sid in effective_seeds]
+            for sid in effective_seeds:
+                if graph.has_node(sid):
+                    visited.add(sid)
+                    hop_distance[sid] = 0
+
+            while queue:
+                node_id, hop = queue.pop(0)
+                if hop >= depth:
+                    continue
+                link_info = graph.get_links(node_id, direction="both", depth=1)
+                for linked in link_info.outgoing + link_info.incoming:
+                    if linked.id not in visited and graph.has_node(linked.id):
+                        visited.add(linked.id)
+                        hop_distance[linked.id] = hop + 1
+                        queue.append((linked.id, hop + 1))
+
+            candidate_ids = list(visited)
+            if not candidate_ids:
+                return []
+
+            # ── Step 3: compute ranking signals ──────────────────────────────
+
+            # 3a. PageRank centrality on induced subgraph
+            centrality: dict[str, float] = {}
+            try:
+                subgraph = graph.graph.subgraph(candidate_ids)
+                if len(subgraph) > 1:
+                    centrality = nx.pagerank(subgraph, alpha=0.85)
+                else:
+                    centrality = {nid: 1.0 for nid in candidate_ids}
+            except Exception:
+                logger.debug(
+                    "graph_search: PageRank failed, falling back to in-degree", exc_info=True
+                )
+                try:
+                    subgraph = graph.graph.subgraph(candidate_ids)
+                    centrality = nx.in_degree_centrality(subgraph)
+                except Exception:
+                    centrality = {}
+
+            # 3b. Semantic similarity scores (optional)
+            sem_by_id: dict[str, SemanticResult] = {}
+            if fuse_semantic:
+                try:
+                    sem_results = self.chroma.search(
+                        query, limit=len(candidate_ids) + 10, threshold=0.0
+                    )
+                    sem_by_id = {r.id: r for r in sem_results if r.id in visited}
+                except Exception:
+                    logger.debug("graph_search: semantic scoring failed", exc_info=True)
+
+            # 3c. Build ranked lists for RRF fusion
+            sorted_by_centrality = sorted(
+                candidate_ids, key=lambda d: centrality.get(d, 0.0), reverse=True
+            )
+            sorted_by_semantic = sorted(
+                candidate_ids,
+                key=lambda d: sem_by_id[d].similarity if d in sem_by_id else 0.0,
+                reverse=True,
+            )
+            # Proximity: lower hop distance = better rank (invert by negating)
+            sorted_by_proximity = sorted(candidate_ids, key=lambda d: hop_distance.get(d, depth))
+
+            rrf_inputs: list[list[str]] = [sorted_by_centrality, sorted_by_proximity]
+            if fuse_semantic and sem_by_id:
+                rrf_inputs.append(sorted_by_semantic)
+
+            rrf_scores = reciprocal_rank_fusion(rrf_inputs)
+            ranked_ids = sorted(rrf_scores, key=lambda d: rrf_scores[d], reverse=True)[:limit]
+
+            # ── Step 4: build SearchResult objects ───────────────────────────
+            results: list[SearchResult] = []
+            for doc_id in ranked_ids:
+                node_data = graph.graph.nodes.get(doc_id, {})
+                title = str(node_data.get("title", doc_id))
+                path = str(node_data.get("path", ""))
+
+                sem_r = sem_by_id.get(doc_id)
+                snippet = sem_r.snippet if sem_r else ""
+                source_url = sem_r.source_url if sem_r else ""
+                updated_at = sem_r.updated_at if sem_r else ""
+                is_stale = sem_r.is_stale if sem_r else False
+
+                results.append(
+                    SearchResult(
+                        id=doc_id,
+                        title=title,
+                        snippet=snippet,
+                        score=rrf_scores.get(doc_id, 0.0),
+                        path=path,
+                        source_url=source_url,
+                        updated_at=updated_at,
+                        is_stale=is_stale,
+                    )
+                )
+
+            return results
+        except Exception as exc:
+            success = False
+            logger.error("Graph search failed: %s", exc)
+            raise SearchBackendError("Graph search failed", {"graph": exc}) from exc
+        finally:
+            elapsed_ms = (time.perf_counter() - start) * 1000
+            lithos_metrics.search_ops.add(1, {"type": "graph"})
+            lithos_metrics.search_duration.record(elapsed_ms, {"type": "graph", "success": success})
 
     def health(self) -> dict[str, str]:
         """Return a health status dict for each backend.

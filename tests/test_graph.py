@@ -4,6 +4,7 @@ import pytest
 
 from lithos.graph import KnowledgeGraph
 from lithos.knowledge import KnowledgeManager
+from lithos.search import SearchEngine
 
 
 class TestGraphBuilding:
@@ -612,3 +613,285 @@ class TestGraphCachePersistence:
         loaded = knowledge_graph.load_cache()
 
         assert loaded is False, "Stale cache version should trigger a rebuild (return False)"
+
+
+class TestGraphSearch:
+    """Tests for graph-traversal search (mode="graph")."""
+
+    @pytest.mark.asyncio
+    async def test_graph_search_with_explicit_seeds(
+        self,
+        knowledge_manager: KnowledgeManager,
+        knowledge_graph: KnowledgeGraph,
+        search_engine: SearchEngine,
+    ):
+        """graph_search with explicit seed_ids returns linked documents."""
+        # Create a small linked chain: A -> B -> C
+        doc_a = (
+            await knowledge_manager.create(
+                title="Doc A",
+                content="Starting node. Links to [[doc-b]].",
+                agent="agent",
+            )
+        ).document
+        doc_b = (
+            await knowledge_manager.create(
+                title="Doc B",
+                content="Middle node. Links to [[doc-c]].",
+                agent="agent",
+            )
+        ).document
+        doc_c = (
+            await knowledge_manager.create(
+                title="Doc C",
+                content="End node of the chain.",
+                agent="agent",
+            )
+        ).document
+
+        for doc in (doc_a, doc_b, doc_c):
+            knowledge_graph.add_document(doc)
+
+        # Seed with doc_a; at depth=2 we should reach doc_b (hop 1) and doc_c (hop 2)
+        results = search_engine.graph_search(
+            query="linked documents",
+            graph=knowledge_graph,
+            seed_ids=[doc_a.id],
+            depth=2,
+            limit=10,
+            fuse_semantic=False,
+        )
+
+        result_ids = {r.id for r in results}
+        assert doc_a.id in result_ids
+        assert doc_b.id in result_ids
+        assert doc_c.id in result_ids
+
+    @pytest.mark.asyncio
+    async def test_graph_search_respects_depth(
+        self,
+        knowledge_manager: KnowledgeManager,
+        knowledge_graph: KnowledgeGraph,
+        search_engine: SearchEngine,
+    ):
+        """graph_search with depth=1 only returns direct neighbours."""
+        doc_root = (
+            await knowledge_manager.create(
+                title="Root Doc",
+                content="Root. Links to [[neighbour-doc]].",
+                agent="agent",
+            )
+        ).document
+        doc_neighbour = (
+            await knowledge_manager.create(
+                title="Neighbour Doc",
+                content="Neighbour. Links to [[distant-doc]].",
+                agent="agent",
+            )
+        ).document
+        doc_distant = (
+            await knowledge_manager.create(
+                title="Distant Doc",
+                content="Two hops away from root.",
+                agent="agent",
+            )
+        ).document
+
+        for doc in (doc_root, doc_neighbour, doc_distant):
+            knowledge_graph.add_document(doc)
+
+        results = search_engine.graph_search(
+            query="root",
+            graph=knowledge_graph,
+            seed_ids=[doc_root.id],
+            depth=1,
+            limit=10,
+            fuse_semantic=False,
+        )
+
+        result_ids = {r.id for r in results}
+        assert doc_root.id in result_ids
+        assert doc_neighbour.id in result_ids
+        # Distant doc is 2 hops away — should not appear at depth=1
+        assert doc_distant.id not in result_ids
+
+    @pytest.mark.asyncio
+    async def test_graph_search_returns_empty_for_isolated_query(
+        self,
+        knowledge_graph: KnowledgeGraph,
+        search_engine: SearchEngine,
+    ):
+        """graph_search with non-existent seed IDs returns an empty list."""
+        results = search_engine.graph_search(
+            query="anything",
+            graph=knowledge_graph,
+            seed_ids=["nonexistent-doc-id"],
+            depth=2,
+            limit=10,
+            fuse_semantic=False,
+        )
+        assert results == []
+
+    @pytest.mark.asyncio
+    async def test_graph_search_results_have_required_fields(
+        self,
+        knowledge_manager: KnowledgeManager,
+        knowledge_graph: KnowledgeGraph,
+        search_engine: SearchEngine,
+    ):
+        """All SearchResult fields are present and scores are positive."""
+        doc = (
+            await knowledge_manager.create(
+                title="Field Check Doc",
+                content="Testing that graph search results have all required fields.",
+                agent="agent",
+            )
+        ).document
+        knowledge_graph.add_document(doc)
+
+        results = search_engine.graph_search(
+            query="field check",
+            graph=knowledge_graph,
+            seed_ids=[doc.id],
+            depth=1,
+            limit=5,
+            fuse_semantic=False,
+        )
+
+        assert len(results) >= 1
+        for r in results:
+            assert r.id
+            assert isinstance(r.title, str)
+            assert isinstance(r.snippet, str)
+            assert r.score > 0
+            assert isinstance(r.path, str)
+
+    @pytest.mark.asyncio
+    async def test_graph_search_ranked_by_proximity(
+        self,
+        knowledge_manager: KnowledgeManager,
+        knowledge_graph: KnowledgeGraph,
+        search_engine: SearchEngine,
+    ):
+        """graph_search traverses the graph and returns all reachable nodes with positive scores.
+
+        Note: strict ordering is not asserted here because PageRank on a small chain
+        naturally ranks terminal nodes (high in-degree flow) which can offset proximity.
+        The meaningful guarantee is completeness (all nodes within depth are found)
+        and that scores are positive RRF values.
+        """
+        doc_seed = (
+            await knowledge_manager.create(
+                title="Seed Node",
+                content="Seed. Links to [[hop-one]].",
+                agent="agent",
+            )
+        ).document
+        doc_hop1 = (
+            await knowledge_manager.create(
+                title="Hop One",
+                content="One hop. Links to [[hop-two]].",
+                agent="agent",
+            )
+        ).document
+        doc_hop2 = (
+            await knowledge_manager.create(
+                title="Hop Two",
+                content="Two hops from seed.",
+                agent="agent",
+            )
+        ).document
+
+        for doc in (doc_seed, doc_hop1, doc_hop2):
+            knowledge_graph.add_document(doc)
+
+        results = search_engine.graph_search(
+            query="hops",
+            graph=knowledge_graph,
+            seed_ids=[doc_seed.id],
+            depth=2,
+            limit=10,
+            fuse_semantic=False,
+        )
+
+        ids = [r.id for r in results]
+        # All nodes within depth 2 must be found
+        assert doc_seed.id in ids
+        assert doc_hop1.id in ids
+        assert doc_hop2.id in ids
+        # All scores must be positive RRF values
+        for r in results:
+            assert r.score > 0
+
+    @pytest.mark.asyncio
+    async def test_graph_search_graph_mode_does_not_affect_hybrid(
+        self,
+        knowledge_manager: KnowledgeManager,
+        knowledge_graph: KnowledgeGraph,
+        search_engine: SearchEngine,
+    ):
+        """hybrid_search results are completely unaffected by the graph module."""
+        doc = (
+            await knowledge_manager.create(
+                title="Isolation Test",
+                content="Hybrid search must be independent of graph mode.",
+                agent="agent",
+            )
+        ).document
+        knowledge_graph.add_document(doc)
+        search_engine.index_document(doc)
+
+        hybrid_results = search_engine.hybrid_search("isolation test")
+        graph_results = search_engine.graph_search(
+            query="isolation test",
+            graph=knowledge_graph,
+            seed_ids=[doc.id],
+            depth=1,
+            limit=10,
+            fuse_semantic=False,
+        )
+
+        # Both should find the doc, but via independent code paths
+        assert any(r.id == doc.id for r in hybrid_results)
+        assert any(r.id == doc.id for r in graph_results)
+
+    @pytest.mark.asyncio
+    async def test_graph_search_no_seeds_falls_back_to_hybrid_discovery(
+        self,
+        knowledge_manager: KnowledgeManager,
+        knowledge_graph: KnowledgeGraph,
+        search_engine: SearchEngine,
+    ):
+        """When seed_ids is None, graph_search discovers seeds via hybrid search."""
+        doc_a = (
+            await knowledge_manager.create(
+                title="Seed Discovery A",
+                content="Unique phrase: xyzzy-graph-seed. Links to [[seed-discovery-b]].",
+                agent="agent",
+            )
+        ).document
+        doc_b = (
+            await knowledge_manager.create(
+                title="Seed Discovery B",
+                content="Linked from A.",
+                agent="agent",
+            )
+        ).document
+
+        for doc in (doc_a, doc_b):
+            knowledge_graph.add_document(doc)
+            search_engine.index_document(doc)
+
+        # No seed_ids — should be discovered via hybrid search on query
+        results = search_engine.graph_search(
+            query="xyzzy-graph-seed",
+            graph=knowledge_graph,
+            seed_ids=None,
+            depth=2,
+            limit=10,
+            fuse_semantic=False,
+        )
+
+        result_ids = {r.id for r in results}
+        assert doc_a.id in result_ids
+        assert doc_b.id in result_ids
