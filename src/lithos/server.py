@@ -824,10 +824,12 @@ class LithosServer:
             author: str | None = None,
             path_prefix: str | None = None,
             threshold: float | None = None,
+            seed_ids: list[str] | None = None,
+            graph_depth: int = 2,
         ) -> dict[str, Any]:
             """Search across the knowledge base.
 
-            Supports three search modes:
+            Supports four search modes:
             - ``hybrid`` (default): Merges Tantivy BM25 full-text and ChromaDB
               cosine-similarity results using Reciprocal Rank Fusion (RRF, k=60).
               Best overall quality.
@@ -835,15 +837,23 @@ class LithosServer:
               query syntax (e.g. field-specific queries, boolean operators).
             - ``semantic``: Pure ChromaDB semantic/vector search. Finds documents
               with similar meaning even when keywords differ.
+            - ``graph``: Wiki-link graph traversal. Discovers related documents by
+              following links from seed documents up to *graph_depth* hops.
+              Seeds are either provided via *seed_ids* or discovered automatically
+              via a fast hybrid search on *query*.
 
             Args:
                 query: Search query string
                 limit: Max results (default: 10)
-                mode: Search mode — "hybrid" | "fulltext" | "semantic" (default: "hybrid")
-                tags: Filter by tags (AND)
-                author: Filter by author (all modes)
-                path_prefix: Filter by path prefix (all modes)
+                mode: Search mode — "hybrid" | "fulltext" | "semantic" | "graph"
+                      (default: "hybrid")
+                tags: Filter by tags (AND) — fulltext/semantic/hybrid only
+                author: Filter by author (fulltext/semantic/hybrid only)
+                path_prefix: Filter by path prefix (fulltext/semantic/hybrid only)
                 threshold: Minimum similarity 0-1 for semantic/hybrid (default: 0.5)
+                seed_ids: Starting document IDs for graph mode.  If omitted,
+                          seeds are discovered via hybrid search.
+                graph_depth: BFS hop depth for graph mode (1-3, default: 2)
 
             Returns:
                 Dict with results list containing id, title, snippet, score, path,
@@ -861,12 +871,12 @@ class LithosServer:
                 span.set_attribute("lithos.limit", limit)
                 span.set_attribute("lithos.mode", mode)
 
-                valid_modes = {"hybrid", "fulltext", "semantic"}
+                valid_modes = {"hybrid", "fulltext", "semantic", "graph"}
                 if mode not in valid_modes:
                     return {
                         "status": "error",
                         "code": "invalid_mode",
-                        "message": f"Unknown search mode {mode!r}. Valid values: hybrid, fulltext, semantic.",
+                        "message": f"Unknown search mode {mode!r}. Valid values: hybrid, fulltext, semantic, graph.",
                     }
 
                 def _build_result(r: Any, score_attr: str = "score") -> dict[str, Any]:
@@ -912,6 +922,20 @@ class LithosServer:
                     results_payload = [
                         _build_result(r, score_attr="similarity") for r in sem_results
                     ]
+                elif mode == "graph":
+                    graph_results = await asyncio.to_thread(
+                        self.search.graph_search,
+                        query=query,
+                        graph=self.graph,
+                        seed_ids=seed_ids,
+                        depth=graph_depth,
+                        limit=limit,
+                        tags=tags,
+                        author=author,
+                        path_prefix=path_prefix,
+                        threshold=threshold,
+                    )
+                    results_payload = [_build_result(r) for r in graph_results]
                 else:
                     # hybrid (default)
                     hybrid_results = await asyncio.to_thread(
