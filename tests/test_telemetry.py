@@ -862,14 +862,54 @@ class TestToolMetrics:
         assert hasattr(counter, "add"), "tool_errors must expose .add()"
 
     def test_all_server_tools_have_tool_metrics_decorator(self):
-        """Every MCP tool in LithosServer._register_tools is annotated with @tool_metrics()."""
+        """Every @self.mcp.tool() in LithosServer._register_tools also has @tool_metrics().
+
+        Counts occurrences of each decorator in the source so the assertion
+        automatically catches new tools added without the metrics decorator.
+        """
         import inspect
 
         from lithos.server import LithosServer
 
         source = inspect.getsource(LithosServer._register_tools)
-        count = source.count("@tool_metrics()")
-        assert count == 24, f"Expected 24 @tool_metrics() decorations, found {count}"
+        mcp_tool_count = source.count("@self.mcp.tool()")
+        metered_count = source.count("@tool_metrics()")
+        assert metered_count == mcp_tool_count, (
+            f"Missing @tool_metrics() on {mcp_tool_count - metered_count} tool(s): "
+            f"found {metered_count} @tool_metrics() decorator(s) but "
+            f"{mcp_tool_count} @self.mcp.tool() decorator(s)"
+        )
+
+    def test_tool_metrics_preserves_signature_for_mcp_introspection(self):
+        """@tool_metrics() does not break the parameter schema seen by the MCP SDK.
+
+        fastmcp calls inspect.signature(fn) to build the JSON schema for each
+        registered tool.  Because tool_metrics uses functools.wraps, inspect
+        follows __wrapped__ and recovers the original signature automatically.
+        """
+        import inspect
+
+        from lithos.telemetry import tool_metrics
+
+        async def lithos_fake(title: str, content: str, agent: str = "anon") -> dict:
+            """Fake tool with a realistic signature."""
+            return {}
+
+        wrapped = tool_metrics()(lithos_fake)
+
+        # __wrapped__ must point back to the original
+        assert wrapped.__wrapped__ is lithos_fake, (
+            "@tool_metrics must set __wrapped__ (via functools.wraps)"
+        )
+
+        # inspect.signature must follow __wrapped__ and see the original params
+        orig_sig = inspect.signature(lithos_fake)
+        wrapped_sig = inspect.signature(wrapped)
+        assert list(orig_sig.parameters) == list(wrapped_sig.parameters), (
+            "inspect.signature on the @tool_metrics wrapper returned different "
+            f"parameters than the original: {list(wrapped_sig.parameters)} != "
+            f"{list(orig_sig.parameters)}"
+        )
 
 
 class TestResourceGauges:
