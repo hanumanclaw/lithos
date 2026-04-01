@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -2065,6 +2066,86 @@ class TestSourceUrlMCPResponses:
         stats = await _call_tool(server, "lithos_stats", {})
         assert "duplicate_urls" in stats
         assert isinstance(stats["duplicate_urls"], int)
+
+    @pytest.mark.asyncio
+    async def test_stats_health_indicators_present(self, server: LithosServer):
+        """lithos_stats includes all health indicator fields."""
+        stats = await _call_tool(server, "lithos_stats", {})
+
+        # Index drift
+        assert "index_drift_detected" in stats
+        assert isinstance(stats["index_drift_detected"], bool)
+
+        # Tantivy doc count may be None when index is not yet written
+        assert "tantivy_doc_count" in stats
+        assert stats["tantivy_doc_count"] is None or isinstance(stats["tantivy_doc_count"], int)
+
+        # Chroma chunk count
+        assert "chroma_chunk_count" in stats
+        assert isinstance(stats["chroma_chunk_count"], int)
+
+        # Unresolved links
+        assert "unresolved_links" in stats
+        assert isinstance(stats["unresolved_links"], int)
+
+        # Expired docs
+        assert "expired_docs" in stats
+        assert isinstance(stats["expired_docs"], int)
+
+        # Expired claims
+        assert "expired_claims" in stats
+        assert isinstance(stats["expired_claims"], int)
+
+        # Index timestamps (None if not yet created)
+        assert "tantivy_last_updated" in stats
+        assert stats["tantivy_last_updated"] is None or isinstance(
+            stats["tantivy_last_updated"], str
+        )
+        assert "chroma_last_updated" in stats
+        assert stats["chroma_last_updated"] is None or isinstance(stats["chroma_last_updated"], str)
+
+        # Graph stats
+        assert "graph_node_count" in stats
+        assert isinstance(stats["graph_node_count"], int)
+        assert "graph_edge_count" in stats
+        assert isinstance(stats["graph_edge_count"], int)
+
+    @pytest.mark.asyncio
+    async def test_stats_expired_docs_counts_stale(self, server: LithosServer):
+        """lithos_stats.expired_docs reflects expired documents."""
+        from datetime import timedelta
+
+        stats_before = await _call_tool(server, "lithos_stats", {})
+        expired_before = stats_before["expired_docs"]
+
+        # Create a document that is already expired
+        await _call_tool(
+            server,
+            "lithos_write",
+            {
+                "title": "Expired Health Doc",
+                "content": "This document is already expired.",
+                "agent": "health-agent",
+                "expires_at": (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat(),
+            },
+        )
+
+        stats_after = await _call_tool(server, "lithos_stats", {})
+        assert stats_after["expired_docs"] >= expired_before + 1
+
+    @pytest.mark.asyncio
+    async def test_stats_no_drift_when_indices_consistent(self, server: LithosServer):
+        """index_drift_detected is False when Tantivy and knowledge are in sync.
+
+        We verify the field exists and has a boolean type; an empty test
+        database may have tantivy_doc_count=None (index not written yet) so
+        drift will be False by definition in that case.
+        """
+        stats = await _call_tool(server, "lithos_stats", {})
+        assert isinstance(stats["index_drift_detected"], bool)
+        # If tantivy index is not yet populated, drift cannot be detected
+        if stats["tantivy_doc_count"] is None:
+            assert stats["index_drift_detected"] is False
 
 
 class TestDerivedFromIdsMCPBoundary:
