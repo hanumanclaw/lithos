@@ -32,9 +32,14 @@ class TestCLIContracts:
     def test_reindex_and_search_output_shape(self, temp_dir):
         config = LithosConfig(storage=StorageConfig(data_dir=temp_dir))
         config.ensure_directories()
+        # set_config() is still required here even though KnowledgeManager now
+        # takes an explicit config arg.  CLI commands invoked via Click's test
+        # runner call get_config() internally (they never receive the config
+        # object directly), so the global singleton must be primed before
+        # runner.invoke() is called.  Do NOT remove these set_config() calls.
         set_config(config)
 
-        knowledge = KnowledgeManager()
+        knowledge = KnowledgeManager(config)
 
         async def _seed() -> None:
             await knowledge.create(
@@ -64,8 +69,10 @@ class TestCLIContracts:
     def test_inspect_doc_output_shape(self, temp_dir):
         config = LithosConfig(storage=StorageConfig(data_dir=temp_dir))
         config.ensure_directories()
+        # set_config() needed for CLI commands invoked via Click's test runner (see
+        # test_reindex_and_search_output_shape for the full explanation).
         set_config(config)
-        knowledge = KnowledgeManager()
+        knowledge = KnowledgeManager(config)
 
         async def _seed():
             return (
@@ -96,8 +103,10 @@ class TestCLIContracts:
     def test_validate_reports_and_fixes(self, temp_dir):
         config = LithosConfig(storage=StorageConfig(data_dir=temp_dir))
         config.ensure_directories()
+        # set_config() needed for CLI commands invoked via Click's test runner (see
+        # test_reindex_and_search_output_shape for the full explanation).
         set_config(config)
-        knowledge = KnowledgeManager()
+        knowledge = KnowledgeManager(config)
 
         async def _seed():
             await knowledge.create(
@@ -128,6 +137,8 @@ class TestCLIContracts:
     def test_search_semantic_no_results_output_shape(self, temp_dir):
         config = LithosConfig(storage=StorageConfig(data_dir=temp_dir))
         config.ensure_directories()
+        # set_config() needed for CLI commands invoked via Click's test runner (see
+        # test_reindex_and_search_output_shape for the full explanation).
         set_config(config)
 
         runner = CliRunner()
@@ -150,6 +161,8 @@ class TestCLIContracts:
     def test_inspect_agents_and_tasks_output_shape(self, temp_dir):
         config = LithosConfig(storage=StorageConfig(data_dir=temp_dir))
         config.ensure_directories()
+        # set_config() needed for CLI commands invoked via Click's test runner (see
+        # test_reindex_and_search_output_shape for the full explanation).
         set_config(config)
 
         async def _seed():
@@ -197,6 +210,8 @@ class TestCLIContracts:
     def test_inspect_health_exit_code_paths(self, temp_dir, monkeypatch):
         config = LithosConfig(storage=StorageConfig(data_dir=temp_dir))
         config.ensure_directories()
+        # set_config() needed for CLI commands invoked via Click's test runner (see
+        # test_reindex_and_search_output_shape for the full explanation).
         set_config(config)
 
         runner = CliRunner()
@@ -226,6 +241,8 @@ class TestCLIContracts:
     def test_serve_stdio_and_sse_paths(self, temp_dir, monkeypatch):
         config = LithosConfig(storage=StorageConfig(data_dir=temp_dir))
         config.ensure_directories()
+        # set_config() needed for CLI commands invoked via Click's test runner (see
+        # test_reindex_and_search_output_shape for the full explanation).
         set_config(config)
 
         calls = {"watch_started": 0, "watch_stopped": 0, "stdio": 0, "sse": 0}
@@ -287,6 +304,8 @@ class TestCLIContracts:
     def test_serve_keyboard_interrupt_stops_watcher(self, temp_dir, monkeypatch):
         config = LithosConfig(storage=StorageConfig(data_dir=temp_dir))
         config.ensure_directories()
+        # set_config() needed for CLI commands invoked via Click's test runner (see
+        # test_reindex_and_search_output_shape for the full explanation).
         set_config(config)
 
         calls = {"stop": 0}

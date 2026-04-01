@@ -58,13 +58,17 @@ class LithosServer:
         """Initialize server.
 
         Args:
-            config: Configuration. Uses global config if not provided.
+            config: LithosConfig instance to use.  If omitted, ``get_config()``
+                is called to obtain the current global config.  The resolved
+                config is then stored and passed explicitly to all components
+                (including :class:`~lithos.knowledge.KnowledgeManager`) — no
+                component performs its own global look-up after this point.
         """
         self._config = config or get_config()
         set_config(self._config)
 
-        # Initialize components
-        self.knowledge = KnowledgeManager()
+        # Initialize components — all receive self._config explicitly.
+        self.knowledge = KnowledgeManager(self._config)
         self.search = SearchEngine(self._config)
         self.graph = KnowledgeGraph(self._config)
         self.coordination = CoordinationService(self._config)
