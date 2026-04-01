@@ -575,9 +575,7 @@ class LithosServer:
                             self.graph.remove_document(doc_id)
                             self.graph.save_cache()
 
-                            lithos_metrics.file_watcher_events.add(
-                                1, {"event_type": "deleted"}
-                            )
+                            lithos_metrics.file_watcher_events.add(1, {"event_type": "deleted"})
                             await self._emit(
                                 LithosEvent(
                                     type=NOTE_DELETED,
@@ -592,9 +590,7 @@ class LithosServer:
                         self.graph.save_cache()
 
                         event_type = "created" if is_new else "updated"
-                        lithos_metrics.file_watcher_events.add(
-                            1, {"event_type": event_type}
-                        )
+                        lithos_metrics.file_watcher_events.add(1, {"event_type": event_type})
                         await self._emit(
                             LithosEvent(
                                 type=NOTE_UPDATED,

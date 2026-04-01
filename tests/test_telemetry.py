@@ -788,9 +788,7 @@ class TestStartupDurationMetric:
 
         mock_hist.record.assert_called_once()
         recorded_value = mock_hist.record.call_args[0][0]
-        assert recorded_value > 0, (
-            f"Expected a positive startup duration, got {recorded_value!r}"
-        )
+        assert recorded_value > 0, f"Expected a positive startup duration, got {recorded_value!r}"
 
 
 class TestFileWatcherEventsCounter:
