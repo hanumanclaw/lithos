@@ -2238,7 +2238,7 @@ class LithosServer:
 
                 # Get search stats
                 search_stats = self.search.get_stats()
-                chroma_chunk_count: int = search_stats.get("chunks", 0)
+                chroma_chunk_count: int = search_stats.get("chroma_chunk_count", 0)
 
                 # Tantivy document count with None-sentinel on failure.
                 # NOTE: this deliberately diverges from _safe_tantivy_count(),
