@@ -172,7 +172,7 @@ class EventBus:
                 return sub.drops
         return 0
 
-    def get_subscriber_id(self, queue: asyncio.Queue[LithosEvent]) -> str | None:
+    def _get_subscriber_id(self, queue: asyncio.Queue[LithosEvent]) -> str | None:
         """Return the subscriber_id for a given queue, or None if not found."""
         for sub in self._subscribers:
             if sub.queue is queue:

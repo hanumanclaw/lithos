@@ -58,6 +58,7 @@ class TestLithosEvent:
 class TestEventBusEmitReceive:
     """Tests for basic emit/receive."""
 
+    @pytest.mark.asyncio
     async def test_emit_receive(self, bus: EventBus) -> None:
         queue = bus.subscribe()
         event = LithosEvent(type=NOTE_CREATED, payload={"id": "123"})
@@ -66,6 +67,7 @@ class TestEventBusEmitReceive:
         assert received.id == event.id
         assert received.type == NOTE_CREATED
 
+    @pytest.mark.asyncio
     async def test_multiple_subscribers(self, bus: EventBus) -> None:
         q1 = bus.subscribe()
         q2 = bus.subscribe()
@@ -74,6 +76,7 @@ class TestEventBusEmitReceive:
         assert q1.get_nowait().id == event.id
         assert q2.get_nowait().id == event.id
 
+    @pytest.mark.asyncio
     async def test_best_effort_in_order_delivery(self, bus: EventBus) -> None:
         """Sequential same-loop emits are delivered in order."""
         queue = bus.subscribe()
@@ -88,6 +91,7 @@ class TestEventBusEmitReceive:
 class TestSubscribeWithTypeFilter:
     """Tests for type-filtered subscriptions."""
 
+    @pytest.mark.asyncio
     async def test_type_filter_matches(self, bus: EventBus) -> None:
         queue = bus.subscribe(event_types=[NOTE_CREATED])
         await bus.emit(LithosEvent(type=NOTE_CREATED))
@@ -95,6 +99,7 @@ class TestSubscribeWithTypeFilter:
         assert queue.qsize() == 1
         assert queue.get_nowait().type == NOTE_CREATED
 
+    @pytest.mark.asyncio
     async def test_type_filter_multiple_types(self, bus: EventBus) -> None:
         queue = bus.subscribe(event_types=[TASK_CREATED, TASK_COMPLETED])
         await bus.emit(LithosEvent(type=TASK_CREATED))
@@ -102,6 +107,7 @@ class TestSubscribeWithTypeFilter:
         await bus.emit(LithosEvent(type=TASK_COMPLETED))
         assert queue.qsize() == 2
 
+    @pytest.mark.asyncio
     async def test_no_filter_receives_all(self, bus: EventBus) -> None:
         queue = bus.subscribe()
         await bus.emit(LithosEvent(type=NOTE_CREATED))
@@ -113,24 +119,28 @@ class TestSubscribeWithTypeFilter:
 class TestSubscribeWithTagFilter:
     """Tests for tag-filtered subscriptions."""
 
+    @pytest.mark.asyncio
     async def test_tag_filter_matches(self, bus: EventBus) -> None:
         queue = bus.subscribe(tags=["python"])
         await bus.emit(LithosEvent(type=NOTE_CREATED, tags=["python", "testing"]))
         await bus.emit(LithosEvent(type=NOTE_CREATED, tags=["docker"]))
         assert queue.qsize() == 1
 
+    @pytest.mark.asyncio
     async def test_tag_filter_any_match(self, bus: EventBus) -> None:
         """Tag filter matches if ANY subscribed tag matches ANY event tag."""
         queue = bus.subscribe(tags=["python", "docker"])
         await bus.emit(LithosEvent(type=NOTE_CREATED, tags=["docker"]))
         assert queue.qsize() == 1
 
+    @pytest.mark.asyncio
     async def test_tag_filter_no_tags_on_event(self, bus: EventBus) -> None:
         """Events with no tags don't match a tag filter."""
         queue = bus.subscribe(tags=["python"])
         await bus.emit(LithosEvent(type=NOTE_CREATED, tags=[]))
         assert queue.qsize() == 0
 
+    @pytest.mark.asyncio
     async def test_combined_type_and_tag_filter(self, bus: EventBus) -> None:
         queue = bus.subscribe(event_types=[NOTE_CREATED], tags=["python"])
         await bus.emit(LithosEvent(type=NOTE_CREATED, tags=["python"]))
@@ -142,6 +152,7 @@ class TestSubscribeWithTagFilter:
 class TestRingBuffer:
     """Tests for the ring buffer."""
 
+    @pytest.mark.asyncio
     async def test_ring_buffer_wraps_at_capacity(self) -> None:
         from lithos.config import EventsConfig
 
@@ -158,6 +169,7 @@ class TestRingBuffer:
 class TestDropOnFull:
     """Tests for backpressure handling."""
 
+    @pytest.mark.asyncio
     async def test_drop_on_full_increments_counter(self) -> None:
         from lithos.config import EventsConfig
 
@@ -170,6 +182,7 @@ class TestDropOnFull:
         assert queue.qsize() == 2
         assert bus.get_drop_count(queue) == 3
 
+    @pytest.mark.asyncio
     async def test_emit_never_raises_on_full(self) -> None:
         from lithos.config import EventsConfig
 
@@ -184,6 +197,7 @@ class TestDropOnFull:
 class TestDisabled:
     """Tests for disabled event bus."""
 
+    @pytest.mark.asyncio
     async def test_noop_when_disabled(self) -> None:
         from lithos.config import EventsConfig
 
@@ -198,12 +212,14 @@ class TestDisabled:
 class TestUnsubscribe:
     """Tests for unsubscribe cleanup."""
 
+    @pytest.mark.asyncio
     async def test_unsubscribe_removes_subscriber(self, bus: EventBus) -> None:
         queue = bus.subscribe()
         bus.unsubscribe(queue)
         await bus.emit(LithosEvent(type=NOTE_CREATED))
         assert queue.qsize() == 0
 
+    @pytest.mark.asyncio
     async def test_unsubscribe_does_not_affect_others(self, bus: EventBus) -> None:
         q1 = bus.subscribe()
         q2 = bus.subscribe()
@@ -212,6 +228,7 @@ class TestUnsubscribe:
         assert q1.qsize() == 0
         assert q2.qsize() == 1
 
+    @pytest.mark.asyncio
     async def test_drop_count_zero_after_unsubscribe(self, bus: EventBus) -> None:
         queue = bus.subscribe()
         bus.unsubscribe(queue)
@@ -226,8 +243,8 @@ class TestSubscriberIdAndMetrics:
         bus = EventBus()
         q1 = bus.subscribe()
         q2 = bus.subscribe()
-        id1 = bus.get_subscriber_id(q1)
-        id2 = bus.get_subscriber_id(q2)
+        id1 = bus._get_subscriber_id(q1)
+        id2 = bus._get_subscriber_id(q2)
         assert id1 is not None
         assert id2 is not None
         assert id1 != id2
@@ -236,12 +253,12 @@ class TestSubscriberIdAndMetrics:
         assert len(id2) == 36
 
     def test_get_subscriber_id_unknown_queue_returns_none(self) -> None:
-        """get_subscriber_id returns None for an unregistered queue."""
+        """_get_subscriber_id returns None for an unregistered queue."""
         import asyncio
 
         bus = EventBus()
         orphan: asyncio.Queue = asyncio.Queue(maxsize=10)
-        assert bus.get_subscriber_id(orphan) is None
+        assert bus._get_subscriber_id(orphan) is None
 
     def test_get_buffer_utilisation_empty_queues(self) -> None:
         """Buffer utilisation is 0.0 when all queues are empty."""
@@ -254,6 +271,7 @@ class TestSubscriberIdAndMetrics:
             assert ratio == 0.0
             assert isinstance(sub_id, str)
 
+    @pytest.mark.asyncio
     async def test_get_buffer_utilisation_partial_fill(self) -> None:
         """Buffer utilisation reflects partial queue fill correctly."""
         from lithos.config import EventsConfig
@@ -269,6 +287,7 @@ class TestSubscriberIdAndMetrics:
         _, ratio = utilisation[0]
         assert ratio == 0.5
 
+    @pytest.mark.asyncio
     async def test_get_buffer_utilisation_full_queue(self) -> None:
         """Buffer utilisation is 1.0 when queue is full."""
         from lithos.config import EventsConfig
@@ -284,6 +303,7 @@ class TestSubscriberIdAndMetrics:
         _, ratio = utilisation[0]
         assert ratio == 1.0
 
+    @pytest.mark.asyncio
     async def test_subscriber_id_consistent_across_drops(self) -> None:
         """The subscriber_id used in drop tracking is stable."""
         from lithos.config import EventsConfig
@@ -291,14 +311,14 @@ class TestSubscriberIdAndMetrics:
         config = EventsConfig(subscriber_queue_size=1)
         bus = EventBus(config)
         queue = bus.subscribe()
-        sub_id = bus.get_subscriber_id(queue)
+        sub_id = bus._get_subscriber_id(queue)
         assert sub_id is not None
         # Cause a drop
         for _ in range(5):
             await bus.emit(LithosEvent(type=NOTE_CREATED))
         assert bus.get_drop_count(queue) > 0
         # Subscriber id is still stable
-        assert bus.get_subscriber_id(queue) == sub_id
+        assert bus._get_subscriber_id(queue) == sub_id
 
     def test_register_event_bus_metrics_no_raise_without_otel(self) -> None:
         """register_event_bus_metrics must not raise when OTEL is inactive."""

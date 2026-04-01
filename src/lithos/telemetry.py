@@ -54,6 +54,7 @@ except ImportError:
 # --- Module state ---
 
 _initialized = False
+_event_bus_metrics_registered = False
 _tracer_provider: Any = None  # TracerProvider when active
 _meter_provider: Any = None  # MeterProvider when active
 _log_provider: Any = None  # LoggerProvider when active
@@ -748,9 +749,6 @@ def register_resource_gauges(
     )
 
 
-_event_bus_metrics_registered: bool = False
-
-
 def register_event_bus_metrics(event_bus: Any) -> None:
     """Register OTEL observable gauge for event bus buffer utilisation.
 
@@ -787,7 +785,7 @@ def register_event_bus_metrics(event_bus: Any) -> None:
     meter.create_observable_gauge(
         "lithos.event_bus.buffer_utilisation",
         callbacks=[_buffer_utilisation_callback],
-        description="Current fill ratio of each subscriber queue (0.0 = empty, 1.0 = full)",
+        description=("Current fill ratio of each subscriber queue (0.0 = empty, 1.0 = full)"),
     )
 
 
@@ -799,8 +797,13 @@ lithos_metrics = _LithosMetrics()
 
 def _reset_for_testing() -> None:
     """Reset module state. For tests only."""
-    global _initialized, _tracer_provider, _meter_provider, _log_provider, _trace_context_filter
-    global _event_bus_metrics_registered
+    global \
+        _initialized, \
+        _tracer_provider, \
+        _meter_provider, \
+        _log_provider, \
+        _trace_context_filter, \
+        _event_bus_metrics_registered
     _initialized = False
     _event_bus_metrics_registered = False
     _tracer_provider = None

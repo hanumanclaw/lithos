@@ -44,6 +44,7 @@ async def _call_tool(server: LithosServer, name: str, arguments: dict[str, Any])
 class TestNoteEventEmission:
     """Test event emission from note (knowledge) tool handlers."""
 
+    @pytest.mark.asyncio
     async def test_lithos_write_create_emits_note_created(self, server: LithosServer) -> None:
         queue = server.event_bus.subscribe(event_types=[NOTE_CREATED])
         result = await _call_tool(
@@ -62,6 +63,7 @@ class TestNoteEventEmission:
         assert event.tags == ["t1"]
         server.event_bus.unsubscribe(queue)
 
+    @pytest.mark.asyncio
     async def test_lithos_write_update_emits_note_updated(self, server: LithosServer) -> None:
         create_result = await _call_tool(
             server,
@@ -90,6 +92,7 @@ class TestNoteEventEmission:
         assert event.payload["title"] == "Updated"
         server.event_bus.unsubscribe(queue)
 
+    @pytest.mark.asyncio
     async def test_lithos_write_duplicate_emits_no_event(self, server: LithosServer) -> None:
         await _call_tool(
             server,
@@ -117,6 +120,7 @@ class TestNoteEventEmission:
         assert queue.empty()
         server.event_bus.unsubscribe(queue)
 
+    @pytest.mark.asyncio
     async def test_lithos_delete_emits_note_deleted(self, server: LithosServer) -> None:
         create_result = await _call_tool(
             server,
@@ -144,6 +148,7 @@ class TestNoteEventEmission:
 class TestTaskEventEmission:
     """Test event emission from task coordination tool handlers."""
 
+    @pytest.mark.asyncio
     async def test_lithos_task_create_emits_task_created(self, server: LithosServer) -> None:
         queue = server.event_bus.subscribe(event_types=[TASK_CREATED])
         result = await _call_tool(
@@ -160,6 +165,7 @@ class TestTaskEventEmission:
         assert event.payload["title"] == "Test Task"
         server.event_bus.unsubscribe(queue)
 
+    @pytest.mark.asyncio
     async def test_lithos_task_claim_emits_task_claimed(self, server: LithosServer) -> None:
         result = await _call_tool(
             server,
@@ -183,6 +189,7 @@ class TestTaskEventEmission:
         assert event.payload["aspect"] == "research"
         server.event_bus.unsubscribe(queue)
 
+    @pytest.mark.asyncio
     async def test_lithos_task_release_emits_task_released(self, server: LithosServer) -> None:
         result = await _call_tool(
             server,
@@ -211,6 +218,7 @@ class TestTaskEventEmission:
         assert event.payload["aspect"] == "research"
         server.event_bus.unsubscribe(queue)
 
+    @pytest.mark.asyncio
     async def test_lithos_task_complete_emits_task_completed(self, server: LithosServer) -> None:
         result = await _call_tool(
             server,
@@ -237,6 +245,7 @@ class TestTaskEventEmission:
 class TestFindingEventEmission:
     """Test event emission from finding tool handlers."""
 
+    @pytest.mark.asyncio
     async def test_lithos_finding_post_emits_finding_posted(self, server: LithosServer) -> None:
         task_result = await _call_tool(
             server,
@@ -265,6 +274,7 @@ class TestFindingEventEmission:
 class TestAgentEventEmission:
     """Test event emission from agent tool handlers."""
 
+    @pytest.mark.asyncio
     async def test_lithos_agent_register_emits_agent_registered(self, server: LithosServer) -> None:
         queue = server.event_bus.subscribe(event_types=[AGENT_REGISTERED])
         result = await _call_tool(
@@ -285,6 +295,7 @@ class TestAgentEventEmission:
 class TestEventEmissionFailureIsolation:
     """Test that event emission failures do not affect tool handler operations."""
 
+    @pytest.mark.asyncio
     async def test_failed_emit_does_not_break_write(self, server: LithosServer) -> None:
         original_emit = server.event_bus.emit
 
@@ -303,6 +314,7 @@ class TestEventEmissionFailureIsolation:
         finally:
             server.event_bus.emit = original_emit  # type: ignore[assignment]
 
+    @pytest.mark.asyncio
     async def test_subscriber_backpressure_does_not_fail_operation(
         self, server: LithosServer
     ) -> None:
@@ -326,6 +338,7 @@ class TestEventEmissionFailureIsolation:
         assert server.event_bus.get_drop_count(queue) >= 1
         server.event_bus.unsubscribe(queue)
 
+    @pytest.mark.asyncio
     async def test_failed_delete_path_emits_no_event(self, server: LithosServer) -> None:
         queue = server.event_bus.subscribe(event_types=[NOTE_DELETED])
 
