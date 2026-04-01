@@ -328,16 +328,16 @@ class LithosServer:
                                 if tag_filter and not any(t in evt.tags for t in tag_filter):
                                     continue
                                 replay_count += 1
-                                yield _format_sse(evt)
                                 lithos_metrics.sse_events_delivered.add(1)
+                                yield _format_sse(evt)
                             replay_span.set_attribute("lithos.sse.replayed", replay_count)
 
                     # Stream live events
                     while True:
                         try:
                             evt = await asyncio.wait_for(queue.get(), timeout=15.0)
-                            yield _format_sse(evt)
                             lithos_metrics.sse_events_delivered.add(1)
+                            yield _format_sse(evt)
                         except asyncio.TimeoutError:
                             # Send keepalive comment to prevent proxy/firewall disconnects
                             yield ": keepalive\n\n"

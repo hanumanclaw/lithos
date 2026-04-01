@@ -778,6 +778,7 @@ class _LithosMetrics:
             self._sse_events_delivered = get_meter().create_counter(
                 "lithos.sse.events_delivered",
                 description="Total SSE events successfully delivered to connected clients",
+                unit="events",
             )
         return self._sse_events_delivered
 
@@ -792,15 +793,25 @@ def register_active_claims_observer(get_active_claim_count: Callable[[], int]) -
     )
 
 
+_sse_active_clients_gauge_registered: bool = False
+
+
 def register_sse_active_clients_observer(get_client_count: Callable[[], int]) -> None:
     """Register an observable gauge for the number of currently connected SSE clients.
 
     The callback must be **synchronous** and cheap — it runs inside the OTEL SDK
     metric collection loop.  Pass a lambda that reads a cached integer counter.
 
+    Idempotent: calling this more than once is a no-op (the gauge is registered
+    at most once per process lifetime).
+
     Gauge registered:
         ``lithos.sse.active_clients`` — number of currently connected SSE clients.
     """
+    global _sse_active_clients_gauge_registered
+    if _sse_active_clients_gauge_registered:
+        return
+    _sse_active_clients_gauge_registered = True
     meter = get_meter()
     meter.create_observable_gauge(
         "lithos.sse.active_clients",
