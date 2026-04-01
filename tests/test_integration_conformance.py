@@ -2131,7 +2131,7 @@ class TestSourceUrlMCPResponses:
         )
 
         stats_after = await _call_tool(server, "lithos_stats", {})
-        assert stats_after["expired_docs"] >= expired_before + 1
+        assert stats_after["expired_docs"] == expired_before + 1
 
     @pytest.mark.asyncio
     async def test_stats_no_drift_when_indices_consistent(self, server: LithosServer):
@@ -2146,6 +2146,38 @@ class TestSourceUrlMCPResponses:
         # If tantivy index is not yet populated, drift cannot be detected
         if stats["tantivy_doc_count"] is None:
             assert stats["index_drift_detected"] is False
+
+    @pytest.mark.asyncio
+    async def test_stats_drift_detected_when_tantivy_count_differs(
+        self, server: LithosServer, monkeypatch
+    ):
+        """index_drift_detected is True when Tantivy count diverges from KnowledgeManager.
+
+        We create one document so KnowledgeManager.document_count == 1, then
+        monkeypatch tantivy.count_docs() to return a stale value (0).  The
+        drift flag must be set to True in the lithos_stats response.
+        """
+        # Seed one document so the knowledge manager has a non-zero document count.
+        await _call_tool(
+            server,
+            "lithos_write",
+            {
+                "title": "Drift Detection Seed Doc",
+                "content": "Intentionally unseeded in Tantivy to trigger drift.",
+                "agent": "drift-test-agent",
+            },
+        )
+        assert server.knowledge.document_count >= 1
+
+        # Simulate a stale / out-of-sync Tantivy index by making count_docs()
+        # return a value that does NOT match the in-memory document count.
+        stale_count = server.knowledge.document_count - 1
+        monkeypatch.setattr(server.search.tantivy, "count_docs", lambda: stale_count)
+
+        stats = await _call_tool(server, "lithos_stats", {})
+
+        assert stats["tantivy_doc_count"] == stale_count
+        assert stats["index_drift_detected"] is True
 
 
 class TestDerivedFromIdsMCPBoundary:

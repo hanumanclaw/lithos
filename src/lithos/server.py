@@ -2240,7 +2240,14 @@ class LithosServer:
                 search_stats = self.search.get_stats()
                 chroma_chunk_count: int = search_stats.get("chunks", 0)
 
-                # Tantivy document count (graceful fallback if index not ready)
+                # Tantivy document count with None-sentinel on failure.
+                # NOTE: this deliberately diverges from _safe_tantivy_count(),
+                # which returns *0* on error (used by OTEL gauge probes where a
+                # numeric value is always required).  Here we return *None* so
+                # callers can distinguish "index not yet written / unavailable"
+                # from "zero documents indexed" — a meaningful difference for
+                # drift detection and health reporting.  If you need the 0-on-
+                # error behaviour, use _safe_tantivy_count() instead.
                 tantivy_doc_count: int | None
                 try:
                     tantivy_doc_count = self.search.tantivy.count_docs()
@@ -2284,6 +2291,9 @@ class LithosServer:
                 return {
                     # Core counts
                     "documents": total_docs,
+                    # "chunks" is the legacy field name kept for backward compatibility.
+                    # "chroma_chunk_count" (below) carries the same value under the
+                    # normalised health-indicator naming scheme.  Do not remove either.
                     "chunks": chroma_chunk_count,
                     "agents": coord_stats.get("agents", 0),
                     "active_tasks": coord_stats.get("active_tasks", 0),
@@ -2293,7 +2303,7 @@ class LithosServer:
                     # Health indicators
                     "index_drift_detected": index_drift_detected,
                     "tantivy_doc_count": tantivy_doc_count,
-                    "chroma_chunk_count": chroma_chunk_count,
+                    "chroma_chunk_count": chroma_chunk_count,  # backward-compat alias for "chunks"
                     "unresolved_links": unresolved_links,
                     "expired_docs": expired_docs,
                     "expired_claims": coord_stats.get("expired_claims", 0),
@@ -2301,6 +2311,12 @@ class LithosServer:
                     "chroma_last_updated": chroma_last_updated,
                     # Graph stats
                     "graph_node_count": graph_stats.get("nodes", 0),
+                    # graph_edge_count reflects ALL edges in the NetworkX graph,
+                    # including edges that point to __unresolved__ placeholder
+                    # nodes (i.e. wiki-links whose target document does not yet
+                    # exist).  It therefore equals resolved_edges + unresolved_links,
+                    # not just resolved edges.  Compare with unresolved_links above
+                    # to infer the resolved-only edge count if needed.
                     "graph_edge_count": graph_stats.get("edges", 0),
                 }
 
