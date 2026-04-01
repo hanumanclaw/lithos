@@ -144,6 +144,16 @@ class TestSlugGeneration:
 class TestKnowledgeManager:
     """Tests for KnowledgeManager CRUD operations."""
 
+    def test_knowledge_manager_requires_config(self):
+        """KnowledgeManager must be constructed with an explicit config.
+
+        The old implicit get_config() fallback was removed in PR #158 to
+        eliminate test-isolation hazards.  This guard ensures no accidental
+        default parameter is re-introduced.
+        """
+        with pytest.raises(TypeError):
+            KnowledgeManager()  # type: ignore[call-arg]
+
     @pytest.mark.asyncio
     async def test_create_document(self, knowledge_manager: KnowledgeManager):
         """Create a new document with all fields."""
