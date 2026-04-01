@@ -44,6 +44,7 @@ from lithos.telemetry import (
     lithos_metrics,
     register_active_claims_observer,
     register_resource_gauges,
+    tool_metrics,
 )
 
 logger = logging.getLogger(__name__)
@@ -606,6 +607,7 @@ class LithosServer:
         # ==================== Knowledge Tools ====================
 
         @self.mcp.tool()
+        @tool_metrics()
         async def lithos_write(
             title: str,
             content: str,
@@ -872,6 +874,7 @@ class LithosServer:
                 }
 
         @self.mcp.tool()
+        @tool_metrics()
         async def lithos_read(
             id: str | None = None,
             path: str | None = None,
@@ -941,6 +944,7 @@ class LithosServer:
                 }
 
         @self.mcp.tool()
+        @tool_metrics()
         async def lithos_delete(
             id: str,
             agent: str,
@@ -986,6 +990,7 @@ class LithosServer:
                 return {"success": True}
 
         @self.mcp.tool()
+        @tool_metrics()
         async def lithos_search(
             query: str,
             limit: int = 10,
@@ -1139,6 +1144,7 @@ class LithosServer:
                 return {"results": results_payload}
 
         @self.mcp.tool()
+        @tool_metrics()
         async def lithos_cache_lookup(
             query: str,
             source_url: str | None = None,
@@ -1323,6 +1329,7 @@ class LithosServer:
                     }
 
         @self.mcp.tool()
+        @tool_metrics()
         async def lithos_list(
             path_prefix: str | None = None,
             tags: list[str] | None = None,
@@ -1445,6 +1452,7 @@ class LithosServer:
         # ==================== Graph Tools ====================
 
         @self.mcp.tool()
+        @tool_metrics()
         async def lithos_links(
             id: str,
             direction: str = "both",
@@ -1483,6 +1491,7 @@ class LithosServer:
                 }
 
         @self.mcp.tool()
+        @tool_metrics()
         async def lithos_provenance(
             id: str,
             direction: str = "both",
@@ -1542,6 +1551,7 @@ class LithosServer:
                 return result
 
         @self.mcp.tool()
+        @tool_metrics()
         async def lithos_tags(
             prefix: str | None = None,
         ) -> dict[str, dict[str, int]]:
@@ -1566,6 +1576,7 @@ class LithosServer:
         # ==================== Agent Tools ====================
 
         @self.mcp.tool()
+        @tool_metrics()
         async def lithos_agent_register(
             id: str,
             name: str | None = None,
@@ -1608,6 +1619,7 @@ class LithosServer:
                 return {"success": success, "created": created}
 
         @self.mcp.tool()
+        @tool_metrics()
         async def lithos_agent_info(
             id: str,
         ) -> dict[str, Any] | None:
@@ -1642,6 +1654,7 @@ class LithosServer:
                 }
 
         @self.mcp.tool()
+        @tool_metrics()
         async def lithos_agent_list(
             type: str | None = None,
             active_since: str | None = None,
@@ -1687,6 +1700,7 @@ class LithosServer:
         # ==================== Coordination Tools ====================
 
         @self.mcp.tool()
+        @tool_metrics()
         async def lithos_task_create(
             title: str,
             agent: str,
@@ -1728,6 +1742,7 @@ class LithosServer:
                 return {"task_id": task_id}
 
         @self.mcp.tool()
+        @tool_metrics()
         async def lithos_task_update(
             task_id: str,
             agent: str,
@@ -1780,6 +1795,7 @@ class LithosServer:
                 }
 
         @self.mcp.tool()
+        @tool_metrics()
         async def lithos_task_claim(
             task_id: str,
             aspect: str,
@@ -1836,6 +1852,7 @@ class LithosServer:
                 }
 
         @self.mcp.tool()
+        @tool_metrics()
         async def lithos_task_renew(
             task_id: str,
             aspect: str,
@@ -1884,6 +1901,7 @@ class LithosServer:
                 }
 
         @self.mcp.tool()
+        @tool_metrics()
         async def lithos_task_release(
             task_id: str,
             aspect: str,
@@ -1934,6 +1952,7 @@ class LithosServer:
                 return {"success": True}
 
         @self.mcp.tool()
+        @tool_metrics()
         async def lithos_task_complete(
             task_id: str,
             agent: str,
@@ -1977,6 +1996,7 @@ class LithosServer:
                 return {"success": True}
 
         @self.mcp.tool()
+        @tool_metrics()
         async def lithos_task_cancel(
             task_id: str,
             agent: str,
@@ -2022,6 +2042,7 @@ class LithosServer:
                 }
 
         @self.mcp.tool()
+        @tool_metrics()
         async def lithos_task_list(
             agent: str | None = None,
             status: str | None = None,
@@ -2059,6 +2080,7 @@ class LithosServer:
                 return {"tasks": tasks}
 
         @self.mcp.tool()
+        @tool_metrics()
         async def lithos_task_status(
             task_id: str,
         ) -> dict[str, list[dict[str, Any]]]:
@@ -2098,6 +2120,7 @@ class LithosServer:
                 }
 
         @self.mcp.tool()
+        @tool_metrics()
         async def lithos_finding_post(
             task_id: str,
             agent: str,
@@ -2144,6 +2167,7 @@ class LithosServer:
                 return {"finding_id": finding_id}
 
         @self.mcp.tool()
+        @tool_metrics()
         async def lithos_finding_list(
             task_id: str,
             since: str | None = None,
@@ -2189,6 +2213,7 @@ class LithosServer:
         # ==================== System Tools ====================
 
         @self.mcp.tool()
+        @tool_metrics()
         async def lithos_stats() -> dict[str, int]:
             """Get knowledge base statistics.
 

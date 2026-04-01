@@ -675,6 +675,243 @@ class TestTraceLogCorrelation:
             _reset_for_testing()
 
 
+class TestToolMetrics:
+    """Tests for the @tool_metrics decorator and per-tool counters (issue #101)."""
+
+    def test_tool_metrics_passthrough_sync(self):
+        """@tool_metrics wraps sync functions and returns the correct value."""
+        from lithos.telemetry import tool_metrics
+
+        @tool_metrics()
+        def my_fn(x: int) -> int:
+            return x * 2
+
+        assert my_fn(5) == 10
+
+    @pytest.mark.asyncio
+    async def test_tool_metrics_passthrough_async(self):
+        """@tool_metrics wraps async functions and returns the correct value."""
+        from lithos.telemetry import tool_metrics
+
+        @tool_metrics()
+        async def my_async_fn(x: int) -> int:
+            return x * 3
+
+        assert await my_async_fn(7) == 21
+
+    def test_tool_metrics_preserves_function_name(self):
+        """@tool_metrics preserves __name__ via functools.wraps."""
+        from lithos.telemetry import tool_metrics
+
+        @tool_metrics()
+        async def lithos_write() -> None:
+            pass
+
+        assert lithos_write.__name__ == "lithos_write"
+
+    def test_tool_metrics_explicit_name_overrides(self):
+        """Explicit tool_name argument is used instead of func.__name__."""
+        from lithos import telemetry as tel
+        from lithos.telemetry import tool_metrics
+
+        calls: list[dict] = []
+
+        class _FakeCounter:
+            def add(self, amount: int, attributes: dict | None = None) -> None:
+                calls.append({"amount": amount, "attributes": attributes})
+
+        tel.lithos_metrics._tool_calls = _FakeCounter()
+        try:
+
+            @tool_metrics("custom_name")
+            def my_fn() -> str:
+                return "ok"
+
+            my_fn()
+            assert any(c["attributes"] == {"tool_name": "custom_name"} for c in calls)
+        finally:
+            tel.lithos_metrics._tool_calls = None
+
+    def test_tool_calls_incremented_on_invocation(self):
+        """lithos_metrics.tool_calls.add is called once per tool invocation."""
+        from lithos import telemetry as tel
+        from lithos.telemetry import tool_metrics
+
+        calls: list[dict] = []
+
+        class _FakeCounter:
+            def add(self, amount: int, attributes: dict | None = None) -> None:
+                calls.append({"amount": amount, "attributes": attributes})
+
+        tel.lithos_metrics._tool_calls = _FakeCounter()
+        tel.lithos_metrics._tool_errors = _FakeCounter()
+
+        try:
+
+            @tool_metrics()
+            def lithos_search() -> str:
+                return "results"
+
+            lithos_search()
+            lithos_search()
+
+            tool_call_entries = [
+                c for c in calls if c["attributes"] == {"tool_name": "lithos_search"}
+            ]
+            assert len(tool_call_entries) == 2
+        finally:
+            tel.lithos_metrics._tool_calls = None
+            tel.lithos_metrics._tool_errors = None
+
+    @pytest.mark.asyncio
+    async def test_tool_errors_incremented_on_exception(self):
+        """lithos_metrics.tool_errors.add is called when the handler raises."""
+        from lithos import telemetry as tel
+        from lithos.telemetry import tool_metrics
+
+        error_calls: list[dict] = []
+        call_calls: list[dict] = []
+
+        class _FakeCallCounter:
+            def add(self, amount: int, attributes: dict | None = None) -> None:
+                call_calls.append({"amount": amount, "attributes": attributes})
+
+        class _FakeErrorCounter:
+            def add(self, amount: int, attributes: dict | None = None) -> None:
+                error_calls.append({"amount": amount, "attributes": attributes})
+
+        tel.lithos_metrics._tool_calls = _FakeCallCounter()
+        tel.lithos_metrics._tool_errors = _FakeErrorCounter()
+
+        try:
+
+            @tool_metrics()
+            async def lithos_write() -> None:
+                raise ValueError("bad input")
+
+            with pytest.raises(ValueError):
+                await lithos_write()
+
+            assert len(call_calls) == 1
+            assert call_calls[0]["attributes"] == {"tool_name": "lithos_write"}
+
+            assert len(error_calls) == 1
+            assert error_calls[0]["attributes"] == {
+                "tool_name": "lithos_write",
+                "error_type": "ValueError",
+            }
+        finally:
+            tel.lithos_metrics._tool_calls = None
+            tel.lithos_metrics._tool_errors = None
+
+    @pytest.mark.asyncio
+    async def test_tool_errors_not_incremented_on_success(self):
+        """tool_errors counter must NOT be incremented for successful calls."""
+        from lithos import telemetry as tel
+        from lithos.telemetry import tool_metrics
+
+        error_calls: list[dict] = []
+
+        class _FakeCallCounter:
+            def add(self, amount: int, attributes: dict | None = None) -> None:
+                pass
+
+        class _FakeErrorCounter:
+            def add(self, amount: int, attributes: dict | None = None) -> None:
+                error_calls.append({"amount": amount, "attributes": attributes})
+
+        tel.lithos_metrics._tool_calls = _FakeCallCounter()
+        tel.lithos_metrics._tool_errors = _FakeErrorCounter()
+
+        try:
+
+            @tool_metrics()
+            async def lithos_read() -> str:
+                return "doc content"
+
+            await lithos_read()
+            assert error_calls == []
+        finally:
+            tel.lithos_metrics._tool_calls = None
+            tel.lithos_metrics._tool_errors = None
+
+    def test_tool_metrics_noop_when_telemetry_disabled(self):
+        """tool_metrics is a transparent no-op when OTEL is not configured."""
+        from lithos.telemetry import _reset_for_testing, tool_metrics
+
+        _reset_for_testing()
+
+        @tool_metrics()
+        def lithos_stats() -> int:
+            return 42
+
+        assert lithos_stats() == 42
+
+    def test_tool_calls_counter_has_add_method(self):
+        """lithos_metrics.tool_calls exposes .add()."""
+        from lithos.telemetry import lithos_metrics
+
+        counter = lithos_metrics.tool_calls
+        assert hasattr(counter, "add"), "tool_calls must expose .add()"
+
+    def test_tool_errors_counter_has_add_method(self):
+        """lithos_metrics.tool_errors exposes .add()."""
+        from lithos.telemetry import lithos_metrics
+
+        counter = lithos_metrics.tool_errors
+        assert hasattr(counter, "add"), "tool_errors must expose .add()"
+
+    def test_all_server_tools_have_tool_metrics_decorator(self):
+        """Every @self.mcp.tool() in LithosServer._register_tools also has @tool_metrics().
+
+        Counts occurrences of each decorator in the source so the assertion
+        automatically catches new tools added without the metrics decorator.
+        """
+        import inspect
+
+        from lithos.server import LithosServer
+
+        source = inspect.getsource(LithosServer._register_tools)
+        mcp_tool_count = source.count("@self.mcp.tool()")
+        metered_count = source.count("@tool_metrics()")
+        assert metered_count == mcp_tool_count, (
+            f"Missing @tool_metrics() on {mcp_tool_count - metered_count} tool(s): "
+            f"found {metered_count} @tool_metrics() decorator(s) but "
+            f"{mcp_tool_count} @self.mcp.tool() decorator(s)"
+        )
+
+    def test_tool_metrics_preserves_signature_for_mcp_introspection(self):
+        """@tool_metrics() does not break the parameter schema seen by the MCP SDK.
+
+        fastmcp calls inspect.signature(fn) to build the JSON schema for each
+        registered tool.  Because tool_metrics uses functools.wraps, inspect
+        follows __wrapped__ and recovers the original signature automatically.
+        """
+        import inspect
+
+        from lithos.telemetry import tool_metrics
+
+        async def lithos_fake(title: str, content: str, agent: str = "anon") -> dict:
+            """Fake tool with a realistic signature."""
+            return {}
+
+        wrapped = tool_metrics()(lithos_fake)
+
+        # __wrapped__ must point back to the original
+        assert wrapped.__wrapped__ is lithos_fake, (
+            "@tool_metrics must set __wrapped__ (via functools.wraps)"
+        )
+
+        # inspect.signature must follow __wrapped__ and see the original params
+        orig_sig = inspect.signature(lithos_fake)
+        wrapped_sig = inspect.signature(wrapped)
+        assert list(orig_sig.parameters) == list(wrapped_sig.parameters), (
+            "inspect.signature on the @tool_metrics wrapper returned different "
+            f"parameters than the original: {list(wrapped_sig.parameters)} != "
+            f"{list(orig_sig.parameters)}"
+        )
+
+
 class TestResourceGauges:
     """Tests for register_resource_gauges (issue #87)."""
 
