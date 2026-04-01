@@ -916,7 +916,14 @@ class TestAgentAndCoordinationMCPTools:
         tags_before = await _call_tool(server, "lithos_tags", {})
         stats_before = await _call_tool(server, "lithos_stats", {})
 
-        for key in ["documents", "chunks", "agents", "active_tasks", "open_claims", "tags"]:
+        for key in [
+            "documents",
+            "chroma_chunk_count",
+            "agents",
+            "active_tasks",
+            "open_claims",
+            "tags",
+        ]:
             assert key in stats_before
             assert isinstance(stats_before[key], int)
 

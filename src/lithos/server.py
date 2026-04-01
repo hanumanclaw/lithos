@@ -2291,10 +2291,7 @@ class LithosServer:
                 return {
                     # Core counts
                     "documents": total_docs,
-                    # "chunks" is the legacy field name kept for backward compatibility.
-                    # "chroma_chunk_count" (below) carries the same value under the
-                    # normalised health-indicator naming scheme.  Do not remove either.
-                    "chunks": chroma_chunk_count,
+                    "chroma_chunk_count": chroma_chunk_count,
                     "agents": coord_stats.get("agents", 0),
                     "active_tasks": coord_stats.get("active_tasks", 0),
                     "open_claims": coord_stats.get("open_claims", 0),
@@ -2303,7 +2300,6 @@ class LithosServer:
                     # Health indicators
                     "index_drift_detected": index_drift_detected,
                     "tantivy_doc_count": tantivy_doc_count,
-                    "chroma_chunk_count": chroma_chunk_count,  # backward-compat alias for "chunks"
                     "unresolved_links": unresolved_links,
                     "expired_docs": expired_docs,
                     "expired_claims": coord_stats.get("expired_claims", 0),
