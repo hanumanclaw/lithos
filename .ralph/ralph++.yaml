@@ -1,0 +1,14 @@
+ralph:
+  sandbox_dir: /home/dns/ai-ml/agents/ralph-dev/ralph-sandbox
+  session_runner: scripts/ralph-single-step.sh
+  max_iterations: 30
+
+orchestrated:
+  run_tests_between_steps: true
+  max_iteration_retries: 1
+  test_commands:
+    - uv run --extra dev pytest tests/
+
+hooks:
+  post_worktree_create:
+    - "uv sync --extra dev"
