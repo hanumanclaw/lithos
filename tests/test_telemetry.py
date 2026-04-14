@@ -1456,9 +1456,7 @@ class TestLcmaMetrics:
         orig = tel_module.lithos_metrics._lcma_scout_duration
         tel_module.lithos_metrics._lcma_scout_duration = mock_hist
         try:
-            tel_module.lithos_metrics.lcma_scout_duration.record(
-                12.5, {"scout": "scout_vector"}
-            )
+            tel_module.lithos_metrics.lcma_scout_duration.record(12.5, {"scout": "scout_vector"})
         finally:
             tel_module.lithos_metrics._lcma_scout_duration = orig
 

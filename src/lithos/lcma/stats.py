@@ -746,9 +746,7 @@ class StatsStore:
         cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
         async with aiosqlite.connect(self.db_path) as db:
             row = await (
-                await db.execute(
-                    "SELECT COUNT(*) FROM enrich_queue WHERE processed_at IS NULL"
-                )
+                await db.execute("SELECT COUNT(*) FROM enrich_queue WHERE processed_at IS NULL")
             ).fetchone()
             self._cached_enrich_queue_depth = int(row[0]) if row else 0
 

@@ -336,9 +336,7 @@ async def run_retrieve(
                 # records each scout's *share* of the Phase A wall-clock duration,
                 # NOT its individual latency. Per-scout latencies are only meaningful
                 # for Phase B scouts, which run sequentially.
-                _lithos_metrics.lcma_scout_duration.record(
-                    _phase_a_elapsed * 1000, {"scout": name}
-                )
+                _lithos_metrics.lcma_scout_duration.record(_phase_a_elapsed * 1000, {"scout": name})
                 _lithos_metrics.lcma_scout_candidates.record(len(result), {"scout": name})
 
         # ── Phase A normalisation for provenance seeding ──────────
