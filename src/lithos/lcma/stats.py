@@ -18,10 +18,22 @@ import logging
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import aiosqlite
 
 from lithos.config import LithosConfig, get_config
+
+if TYPE_CHECKING:
+    from lithos.telemetry import _LithosMetrics
+
+_lithos_metrics: _LithosMetrics | None = None
+try:
+    from lithos.telemetry import lithos_metrics as _lithos_metrics
+
+    _HAS_TELEMETRY = True
+except Exception:
+    _HAS_TELEMETRY = False
 
 logger = logging.getLogger(__name__)
 
@@ -143,6 +155,9 @@ class StatsStore:
     def __init__(self, config: LithosConfig | None = None) -> None:
         self._config = config
         self._opened = False
+        self._cached_enrich_queue_depth: int = 0
+        self._cached_coactivation_pairs: int = 0
+        self._cached_working_memory_active_tasks: int = 0
 
     @property
     def config(self) -> LithosConfig:
@@ -587,6 +602,25 @@ class StatsStore:
             rows = await cursor.fetchall()
         return [dict(r) for r in rows]
 
+    async def get_enrich_items_by_ids(self, item_ids: list[int]) -> list[dict[str, object]]:
+        """Return enrich_queue rows for the given IDs including triggered_at, processed_at, attempts.
+
+        Used by the enrichment worker to record OTEL metrics after draining.
+        """
+        if not item_ids:
+            return []
+        await self._ensure_open()
+        placeholders = ", ".join("?" for _ in item_ids)
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                f"SELECT id, triggered_at, processed_at, attempts FROM enrich_queue "
+                f"WHERE id IN ({placeholders})",
+                tuple(item_ids),
+            )
+            rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
     # ------------------------------------------------------------------
     # Node stats operations
     # ------------------------------------------------------------------
@@ -687,6 +721,51 @@ class StatsStore:
             rows = await cursor.fetchall()
         return [row[0] for row in rows]
 
+    # ------------------------------------------------------------------
+    # Observable gauge helpers (synchronous cached counts for OTEL)
+    # ------------------------------------------------------------------
+
+    # These are populated by _refresh_cached_counts() which is called
+    # periodically by the OTEL metric collection loop via register_lcma_metrics.
+
+    def get_cached_enrich_queue_depth(self) -> int:
+        """Return the last cached enrich_queue unprocessed item count (sync, cheap)."""
+        return self._cached_enrich_queue_depth
+
+    def get_cached_coactivation_pairs(self) -> int:
+        """Return the last cached coactivation row count (sync, cheap)."""
+        return self._cached_coactivation_pairs
+
+    def get_cached_working_memory_active_tasks(self) -> int:
+        """Return the last cached active working_memory task count (sync, cheap)."""
+        return self._cached_working_memory_active_tasks
+
+    async def refresh_cached_counts(self) -> None:
+        """Refresh the cached gauge values from the database.
+
+        Called periodically (e.g. from the enrich drain loop) so that OTEL
+        observable gauges always report a recent value without requiring async
+        callbacks in the SDK metric collection path.
+        """
+        await self._ensure_open()
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+        async with aiosqlite.connect(self.db_path) as db:
+            row = await (
+                await db.execute("SELECT COUNT(*) FROM enrich_queue WHERE processed_at IS NULL")
+            ).fetchone()
+            self._cached_enrich_queue_depth = int(row[0]) if row else 0
+
+            row = await (await db.execute("SELECT COUNT(*) FROM coactivation")).fetchone()
+            self._cached_coactivation_pairs = int(row[0]) if row else 0
+
+            row = await (
+                await db.execute(
+                    "SELECT COUNT(DISTINCT task_id) FROM working_memory WHERE last_seen_at >= ?",
+                    (cutoff,),
+                )
+            ).fetchone()
+            self._cached_working_memory_active_tasks = int(row[0]) if row else 0
+
     async def update_salience(self, node_id: str, delta: float) -> None:
         """Atomically adjust salience by *delta*, clamping to [0.0, 1.0].
 
@@ -703,6 +782,8 @@ class StatsStore:
                 (node_id, initial, delta),
             )
             await db.commit()
+        if _HAS_TELEMETRY and _lithos_metrics is not None:
+            _lithos_metrics.lcma_salience_updates.add(1)
 
     async def increment_ignored(self, node_id: str) -> None:
         """Atomically increment ignored_count; creates row if absent."""

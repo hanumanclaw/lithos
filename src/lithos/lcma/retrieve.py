@@ -21,6 +21,7 @@ import collections
 import itertools
 import logging
 import re
+import time
 from typing import TYPE_CHECKING
 
 from lithos.lcma.scouts import (
@@ -48,6 +49,15 @@ if TYPE_CHECKING:
     from lithos.knowledge import KnowledgeManager
     from lithos.lcma.edges import EdgeStore
     from lithos.search import SearchEngine
+    from lithos.telemetry import _LithosMetrics
+
+_lithos_metrics: _LithosMetrics | None = None
+try:
+    from lithos.telemetry import lithos_metrics as _lithos_metrics
+
+    _HAS_TELEMETRY = True
+except Exception:
+    _HAS_TELEMETRY = False
 
 logger = logging.getLogger(__name__)
 
@@ -202,6 +212,13 @@ def _dominant_namespace(
     return min(ns for ns, c in ns_counts.items() if c == max_count)
 
 
+_COLD_START_TEMPERATURE = 0.5  # temperatures at or above this value indicate cold-start conditions
+# NOTE: temperature_default is 0.5 (LcmaConfig default), which exactly meets this threshold,
+# so the cold-start counter fires for every MVP1 call (no real graph data yet).
+# In MVP3, compute_temperature will return values derived from edge coherence; only
+# genuinely warm graphs (high coherence → low temperature) will stay below this threshold.
+
+
 async def compute_temperature(
     edge_store: EdgeStore,
     lcma_config: LcmaConfig,
@@ -214,9 +231,16 @@ async def compute_temperature(
     MVP 3, when ``edges.db`` has been populated with enough typed edges to
     make coherence meaningful. The ``edge_store`` parameter is preserved in
     the signature so callers do not need to change when MVP 3 activates it.
+
+    Temperature semantics: high temperature (≥ ``_COLD_START_TEMPERATURE``)
+    indicates insufficient graph data (cold start). Low temperature indicates
+    a well-connected graph with high coherence.
     """
     del edge_store, namespace_filter  # unused in MVP 1
-    return lcma_config.temperature_default
+    temperature = lcma_config.temperature_default
+    if _HAS_TELEMETRY and _lithos_metrics is not None and temperature >= _COLD_START_TEMPERATURE:
+        _lithos_metrics.lcma_temperature_cold_start.add(1)
+    return temperature
 
 
 async def run_retrieve(
@@ -254,6 +278,7 @@ async def run_retrieve(
     terrace_reached = 0
     temperature: float = lcma_config.temperature_default
     conflicts_found: list[dict[str, object]] = []
+    _retrieve_t0 = time.perf_counter()
 
     try:
         # ── Phase A: parallel scouts ──────────────────────────────
@@ -294,7 +319,9 @@ async def run_retrieve(
                 scout_task_context(coordination, knowledge, limit=limit, **scout_kw)
             )
 
+        _phase_a_start = time.perf_counter()
         phase_a_results = await asyncio.gather(*phase_a_coros, return_exceptions=True)
+        _phase_a_elapsed = time.perf_counter() - _phase_a_start
 
         # Collect successful results AND track which scouts ran cleanly.
         executed_scouts: set[str] = set()
@@ -305,6 +332,14 @@ async def run_retrieve(
                 continue
             executed_scouts.add(name)
             all_candidates.extend(result)
+            if _HAS_TELEMETRY and _lithos_metrics is not None:
+                # Phase A scouts run concurrently via asyncio.gather, so all scouts
+                # share the same wall-clock elapsed time (_phase_a_elapsed). This
+                # records each scout's *share* of the Phase A wall-clock duration,
+                # NOT its individual latency. Per-scout latencies are only meaningful
+                # for Phase B scouts, which run sequentially.
+                _lithos_metrics.lcma_scout_duration.record(_phase_a_elapsed * 1000, {"scout": name})
+                _lithos_metrics.lcma_scout_candidates.record(len(result), {"scout": name})
 
         # ── Phase A normalisation for provenance seeding ──────────
         phase_a_normalised = merge_and_normalize(all_candidates)
@@ -314,38 +349,70 @@ async def run_retrieve(
         seed_ids = [c.node_id for c in phase_a_normalised[:max_context_nodes]]
         if seed_ids:
             try:
+                _t = time.perf_counter()
                 prov_candidates = await scout_provenance(
                     seed_ids, knowledge, limit=limit, **scout_kw
                 )
                 executed_scouts.add("scout_provenance")
                 all_candidates.extend(prov_candidates)
+                if _HAS_TELEMETRY and _lithos_metrics is not None:
+                    _lithos_metrics.lcma_scout_duration.record(
+                        (time.perf_counter() - _t) * 1000, {"scout": "scout_provenance"}
+                    )
+                    _lithos_metrics.lcma_scout_candidates.record(
+                        len(prov_candidates), {"scout": "scout_provenance"}
+                    )
             except Exception:
                 logger.warning("Phase B (provenance) failed", exc_info=True)
 
             try:
+                _t = time.perf_counter()
                 graph_candidates = await scout_graph(
                     seed_ids, graph, edge_store, knowledge, limit=limit, **scout_kw
                 )
                 executed_scouts.add("scout_graph")
                 all_candidates.extend(graph_candidates)
+                if _HAS_TELEMETRY and _lithos_metrics is not None:
+                    _lithos_metrics.lcma_scout_duration.record(
+                        (time.perf_counter() - _t) * 1000, {"scout": "scout_graph"}
+                    )
+                    _lithos_metrics.lcma_scout_candidates.record(
+                        len(graph_candidates), {"scout": "scout_graph"}
+                    )
             except Exception:
                 logger.warning("Phase B (graph) failed", exc_info=True)
 
             try:
+                _t = time.perf_counter()
                 coact_candidates = await scout_coactivation(
                     seed_ids, stats_store, knowledge, limit=limit, **scout_kw
                 )
                 executed_scouts.add("scout_coactivation")
                 all_candidates.extend(coact_candidates)
+                if _HAS_TELEMETRY and _lithos_metrics is not None:
+                    _lithos_metrics.lcma_scout_duration.record(
+                        (time.perf_counter() - _t) * 1000, {"scout": "scout_coactivation"}
+                    )
+                    _lithos_metrics.lcma_scout_candidates.record(
+                        len(coact_candidates), {"scout": "scout_coactivation"}
+                    )
             except Exception:
                 logger.warning("Phase B (coactivation) failed", exc_info=True)
 
             try:
+                _t = time.perf_counter()
                 src_url_candidates = await scout_source_url(
                     seed_ids, knowledge, limit=limit, **scout_kw
                 )
                 executed_scouts.add("scout_source_url")
                 all_candidates.extend(src_url_candidates)
+                if _HAS_TELEMETRY and _lithos_metrics is not None:
+                    _lithos_metrics.lcma_scout_duration.record(
+                        (time.perf_counter() - _t) * 1000, {"scout": "scout_source_url"}
+                    )
+                    _lithos_metrics.lcma_scout_candidates.record(
+                        len(src_url_candidates), {"scout": "scout_source_url"}
+                    )
             except Exception:
                 logger.warning("Phase B (source_url) failed", exc_info=True)
 
@@ -455,6 +522,16 @@ async def run_retrieve(
         return envelope
 
     finally:
+        # ── OTEL retrieve metrics ─────────────────────────────────
+        if _HAS_TELEMETRY and _lithos_metrics is not None:
+            try:
+                _retrieve_elapsed_ms = (time.perf_counter() - _retrieve_t0) * 1000
+                _lithos_metrics.lcma_retrieve_duration.record(_retrieve_elapsed_ms)
+                _lithos_metrics.lcma_retrieve_candidates_considered.record(candidates_considered)
+                _lithos_metrics.lcma_retrieve_final_nodes.record(len(final_nodes))
+            except Exception:
+                logger.debug("run_retrieve: failed to record OTEL metrics", exc_info=True)
+
         # ── Receipt — always written (even on error) ──────────────
         try:
             await stats_store.insert_receipt(
