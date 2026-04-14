@@ -206,10 +206,16 @@ class CoordinationService:
         old_path = self.config.storage.data_dir / "coordination.db"
         if old_path.exists() and not self.db_path.exists() and old_path != self.db_path:
             old_path.rename(self.db_path)
+            logger.info(
+                "coordination.db migrated: old_path=%s new_path=%s",
+                old_path,
+                self.db_path,
+            )
 
         async with aiosqlite.connect(self.db_path) as db:
             await db.executescript(SCHEMA)
             await db.commit()
+        logger.info("coordination service initialized: db_path=%s", self.db_path)
 
     async def _get_db(self) -> aiosqlite.Connection:
         """Get database connection."""
@@ -291,7 +297,23 @@ class CoordinationService:
                 )
 
             await db.commit()
-            return True, not exists
+            created = not exists
+            if created:
+                logger.info(
+                    "Agent registered: agent_id=%s name=%s type=%s",
+                    agent_id,
+                    name,
+                    agent_type,
+                    extra={"agent_id": agent_id, "name": name, "agent_type": agent_type},
+                )
+            else:
+                logger.debug(
+                    "Agent updated: agent_id=%s name=%s type=%s",
+                    agent_id,
+                    name,
+                    agent_type,
+                )
+            return True, created
 
     async def get_agent(self, agent_id: str) -> Agent | None:
         """Get agent information."""
@@ -487,7 +509,16 @@ class CoordinationService:
                 params,
             )
             await db.commit()
-            return cursor.rowcount > 0
+            updated = cursor.rowcount > 0
+            if updated:
+                logger.info(
+                    "Task updated: task_id=%s agent=%s fields=%s",
+                    task_id,
+                    agent,
+                    sets,
+                    extra={"task_id": task_id, "agent": agent, "fields": sets},
+                )
+            return updated
 
     @traced("lithos.coordination.complete_task")
     async def complete_task(self, task_id: str, agent: str) -> bool:
@@ -542,6 +573,13 @@ class CoordinationService:
             )
 
             await db.commit()
+            logger.info(
+                "Task cancelled: task_id=%s agent=%s reason=%s",
+                task_id,
+                agent,
+                reason,
+                extra={"task_id": task_id, "agent": agent, "reason": reason},
+            )
             return True
 
     async def list_tasks(
@@ -843,7 +881,23 @@ class CoordinationService:
                 (task_id, aspect, agent),
             )
             await db.commit()
-            return cursor.rowcount > 0
+            released = cursor.rowcount > 0
+            if released:
+                logger.info(
+                    "Claim released: task_id=%s aspect=%s agent=%s",
+                    task_id,
+                    aspect,
+                    agent,
+                    extra={"task_id": task_id, "aspect": aspect, "agent": agent},
+                )
+            else:
+                logger.debug(
+                    "Claim release no-op (not held): task_id=%s aspect=%s agent=%s",
+                    task_id,
+                    aspect,
+                    agent,
+                )
+            return released
 
     # ==================== Finding Operations ====================
 

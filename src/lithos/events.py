@@ -115,6 +115,19 @@ class EventBus:
         with tracer.start_as_current_span("lithos.event_bus.emit") as span:
             span.set_attribute("lithos.event.type", event.type)
             lithos_metrics.event_bus_ops.add(1, {"op": "emit", "event_type": event.type})
+            logger.debug(
+                "event_bus emit: event_type=%s event_id=%s agent=%s subscriber_count=%d",
+                event.type,
+                event.id,
+                event.agent,
+                len(self._subscribers),
+                extra={
+                    "event_type": event.type,
+                    "event_id": event.id,
+                    "agent": event.agent,
+                    "subscriber_count": len(self._subscribers),
+                },
+            )
 
             try:
                 self._buffer.append(event)
@@ -132,6 +145,17 @@ class EventBus:
                     lithos_metrics.event_bus_ops.add(1, {"op": "drop", "event_type": event.type})
                     lithos_metrics.event_bus_subscriber_drops.add(
                         1, {"subscriber_id": sub.subscriber_id}
+                    )
+                    logger.warning(
+                        "event_bus queue full: subscriber_id=%s event_type=%s total_drops=%d",
+                        sub.subscriber_id,
+                        event.type,
+                        sub.drops,
+                        extra={
+                            "subscriber_id": sub.subscriber_id,
+                            "event_type": event.type,
+                            "total_drops": sub.drops,
+                        },
                     )
                 except Exception:
                     logger.exception("EventBus.emit: failed to deliver to subscriber")
@@ -159,11 +183,31 @@ class EventBus:
         queue: asyncio.Queue[LithosEvent] = asyncio.Queue(maxsize=q_size)
         sub = _Subscriber(queue=queue, event_types=event_types, tag_filter=tags)
         self._subscribers.append(sub)
+        logger.debug(
+            "event_bus subscribe: subscriber_id=%s event_types=%s queue_size=%d total_subscribers=%d",
+            sub.subscriber_id,
+            event_types,
+            q_size,
+            len(self._subscribers),
+            extra={
+                "subscriber_id": sub.subscriber_id,
+                "event_types": event_types,
+                "queue_size": q_size,
+                "total_subscribers": len(self._subscribers),
+            },
+        )
         return queue
 
     def unsubscribe(self, queue: asyncio.Queue[LithosEvent]) -> None:
         """Remove a subscriber by its queue reference."""
+        sub_id = self._get_subscriber_id(queue)
         self._subscribers = [s for s in self._subscribers if s.queue is not queue]
+        logger.debug(
+            "event_bus unsubscribe: subscriber_id=%s total_subscribers=%d",
+            sub_id,
+            len(self._subscribers),
+            extra={"subscriber_id": sub_id, "total_subscribers": len(self._subscribers)},
+        )
 
     def get_drop_count(self, queue: asyncio.Queue[LithosEvent]) -> int:
         """Get the drop counter for a subscriber queue."""

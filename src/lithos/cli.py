@@ -1,6 +1,7 @@
 """Lithos CLI - Command-line interface."""
 
 import asyncio
+import logging
 import sys
 from pathlib import Path
 
@@ -8,6 +9,8 @@ import click
 
 from lithos.config import LithosConfig, load_config, set_config
 from lithos.logging_config import setup_logging
+
+logger = logging.getLogger(__name__)
 
 
 @click.group()
@@ -82,14 +85,24 @@ def serve(
     async def run_server() -> None:
         # Initialize server
         click.echo("Initializing Lithos...")
+        logger.info(
+            "lithos server initializing: transport=%s data_dir=%s watch=%s",
+            transport,
+            config.storage.data_dir,
+            watch,
+            extra={"transport": transport, "data_dir": str(config.storage.data_dir), "watch": watch},
+        )
         await server.initialize()
+        logger.info("lithos server initialized: data_dir=%s", config.storage.data_dir)
 
         # Start file watcher if enabled
         if watch:
             click.echo("Starting file watcher...")
             server.start_file_watcher()
+            logger.info("file watcher started: knowledge_path=%s", config.storage.knowledge_path)
 
         click.echo(f"Starting MCP server ({transport} transport)...")
+        logger.info("MCP server starting: transport=%s", transport)
 
         if transport == "stdio":
             # Run with stdio transport
@@ -128,8 +141,10 @@ def serve(
         asyncio.run(run_server())
     except KeyboardInterrupt:
         click.echo("\nShutting down...")
+        logger.info("lithos server shutting down (KeyboardInterrupt)")
         server.stop_file_watcher()
         asyncio.run(server.stop_enrich_worker())
+        logger.info("lithos server stopped")
     finally:
         shutdown_telemetry()
 
@@ -157,6 +172,7 @@ def reindex(ctx: click.Context, clear: bool) -> None:
     async def do_reindex() -> None:
         if clear:
             click.echo("Clearing existing indices...")
+            logger.info("reindex: clearing existing indices clear=True")
             search.clear_all()
             graph.clear()
 
@@ -164,6 +180,7 @@ def reindex(ctx: click.Context, clear: bool) -> None:
         files = list(knowledge_path.rglob("*.md"))
 
         click.echo(f"Found {len(files)} markdown files")
+        logger.info("reindex started: file_count=%d clear=%s", len(files), clear)
 
         indexed = 0
         errors = 0
@@ -179,11 +196,13 @@ def reindex(ctx: click.Context, clear: bool) -> None:
                 except Exception as e:
                     errors += 1
                     click.echo(f"\nError indexing {file_path}: {e}", err=True)
+                    logger.error("reindex error: path=%s error=%s", file_path, e)
 
         # Save graph cache
         graph.save_cache()
 
         click.echo(f"\nIndexed {indexed} documents")
+        logger.info("reindex complete: indexed=%d errors=%d", indexed, errors)
         if errors:
             click.echo(f"Errors: {errors}", err=True)
 

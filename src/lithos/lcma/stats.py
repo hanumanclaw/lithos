@@ -251,6 +251,23 @@ class StatsStore:
                 ),
             )
             await db.commit()
+        logger.info(
+            "receipt inserted: id=%s agent=%s task=%s candidates=%d final_nodes=%d scouts=%s",
+            receipt_id,
+            agent_id,
+            task_id,
+            candidates_considered,
+            len(final_nodes),
+            scouts_fired,
+            extra={
+                "receipt_id": receipt_id,
+                "agent_id": agent_id,
+                "task_id": task_id,
+                "candidates_considered": candidates_considered,
+                "final_node_count": len(final_nodes),
+                "scouts_fired": scouts_fired,
+            },
+        )
 
     # ------------------------------------------------------------------
     # Working-memory operations
@@ -321,6 +338,17 @@ class StatsStore:
                 )
             deleted = cursor.rowcount
             await db.commit()
+        logger.info(
+            "working_memory evicted: deleted=%d ttl_days=%d completed_task_count=%d",
+            deleted,
+            ttl_days,
+            len(completed_task_ids),
+            extra={
+                "deleted": deleted,
+                "ttl_days": ttl_days,
+                "completed_task_count": len(completed_task_ids),
+            },
+        )
         return deleted
 
     # ------------------------------------------------------------------
@@ -438,6 +466,13 @@ class StatsStore:
                 (trigger_type, node_id, task_id),
             )
             await db.commit()
+        logger.debug(
+            "enrich_queue enqueued: trigger=%s node_id=%s task_id=%s",
+            trigger_type,
+            node_id,
+            task_id,
+            extra={"trigger_type": trigger_type, "node_id": node_id, "task_id": task_id},
+        )
 
     async def drain_pending_nodes(
         self, *, max_attempts: int | None = None
@@ -507,6 +542,13 @@ class StatsStore:
             assert isinstance(entry["trigger_types"], set)
             entry["trigger_types"] = sorted(entry["trigger_types"])
             result.append(entry)
+
+        logger.debug(
+            "drain_pending_nodes: raw_rows=%d distinct_nodes=%d",
+            len(rows),
+            len(result),
+            extra={"raw_rows": len(rows), "distinct_nodes": len(result)},
+        )
         return result
 
     async def drain_pending_tasks(
@@ -582,6 +624,12 @@ class StatsStore:
             )
             count = cursor.rowcount
             await db.commit()
+        logger.warning(
+            "enrich_queue requeue_failed: requeued=%d requested=%d",
+            count,
+            len(claimed_ids),
+            extra={"requeued": count, "requested": len(claimed_ids)},
+        )
         return count
 
     async def get_exhausted_items(
@@ -659,6 +707,11 @@ class StatsStore:
                 [(nid, now) for nid in node_ids],
             )
             await db.commit()
+        logger.debug(
+            "node_stats batch increment: node_count=%d",
+            len(node_ids),
+            extra={"node_count": len(node_ids)},
+        )
 
     async def increment_coactivation_batch(
         self,
@@ -784,6 +837,12 @@ class StatsStore:
             await db.commit()
         if _HAS_TELEMETRY and _lithos_metrics is not None:
             _lithos_metrics.lcma_salience_updates.add(1)
+        logger.debug(
+            "salience updated: node_id=%s delta=%.4f",
+            node_id,
+            delta,
+            extra={"node_id": node_id, "delta": delta},
+        )
 
     async def increment_ignored(self, node_id: str) -> None:
         """Atomically increment ignored_count; creates row if absent."""
@@ -1019,6 +1078,7 @@ class StatsStore:
             await db.execute(
                 "ALTER TABLE node_stats ADD COLUMN cited_count INTEGER NOT NULL DEFAULT 0"
             )
+            logger.info("stats.db migration applied: added node_stats.cited_count")
 
     @staticmethod
     async def _migrate_add_last_decay_applied_at(db: aiosqlite.Connection) -> None:
@@ -1027,6 +1087,7 @@ class StatsStore:
         columns = {row[1] for row in await cursor.fetchall()}
         if "last_decay_applied_at" not in columns:
             await db.execute("ALTER TABLE node_stats ADD COLUMN last_decay_applied_at TIMESTAMP")
+            logger.info("stats.db migration applied: added node_stats.last_decay_applied_at")
 
     @staticmethod
     async def _migrate_add_enrich_queue_attempts(db: aiosqlite.Connection) -> None:
@@ -1037,6 +1098,7 @@ class StatsStore:
             await db.execute(
                 "ALTER TABLE enrich_queue ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0"
             )
+            logger.info("stats.db migration applied: added enrich_queue.attempts")
 
     @staticmethod
     async def _probe(path: Path) -> bool:

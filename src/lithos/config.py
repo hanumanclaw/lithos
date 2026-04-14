@@ -1,5 +1,6 @@
 """Configuration management for Lithos."""
 
+import logging
 import os
 from pathlib import Path
 from typing import Any, Literal
@@ -7,6 +8,8 @@ from typing import Any, Literal
 import yaml
 from pydantic import BaseModel, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+logger = logging.getLogger(__name__)
 
 # Canonical LCMA note_type values — must match VALID_NOTE_TYPES in knowledge.py
 _LCMA_NOTE_TYPES = frozenset(
@@ -254,32 +257,42 @@ class LithosConfig(BaseSettings):
             "data_dir" not in self.storage.model_fields_set
         ):
             self.storage.data_dir = Path(data_dir)
+            logger.debug("Config env override: LITHOS_DATA_DIR=%s", data_dir)
         if (port := os.environ.get("LITHOS_PORT")) and ("port" not in self.server.model_fields_set):
             try:
                 self.server.port = int(port)
+                logger.debug("Config env override: LITHOS_PORT=%s", port)
             except ValueError:
                 raise ValueError(f"LITHOS_PORT must be a valid integer, got {port!r}") from None
         if (host := os.environ.get("LITHOS_HOST")) and ("host" not in self.server.model_fields_set):
             self.server.host = host
+            logger.debug("Config env override: LITHOS_HOST=%s", host)
         if (otel_enabled := os.environ.get("LITHOS_OTEL_ENABLED")) and (
             "enabled" not in self.telemetry.model_fields_set
         ):
             self.telemetry.enabled = otel_enabled.lower() in ("1", "true")
+            logger.debug("Config env override: LITHOS_OTEL_ENABLED=%s", otel_enabled)
         if (otlp_endpoint := os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT")) and (
             "endpoint" not in self.telemetry.model_fields_set
         ):
             self.telemetry.endpoint = otlp_endpoint
+            logger.debug("Config env override: OTEL_EXPORTER_OTLP_ENDPOINT=%s", otlp_endpoint)
         return self
 
     @classmethod
     def from_yaml(cls, path: Path) -> "LithosConfig":
         """Load configuration from YAML file."""
         if not path.exists():
+            logger.warning(
+                "Config file not found, using defaults: path=%s", path,
+                extra={"config_path": str(path)},
+            )
             return cls()
 
         with open(path) as f:
             data = yaml.safe_load(f) or {}
 
+        logger.info("Config loaded from file: path=%s", path, extra={"config_path": str(path)})
         return cls(**data)
 
     def ensure_directories(self) -> None:

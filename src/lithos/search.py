@@ -959,6 +959,13 @@ class SearchEngine:
                 errors,
             )
 
+        logger.debug(
+            "index_document: doc_id=%s chunks=%d backends_failed=%d",
+            doc.id,
+            chunks,
+            len(errors),
+            extra={"doc_id": doc.id, "chunks": chunks, "backends_failed": len(errors)},
+        )
         return chunks
 
     @traced("lithos.search.remove_document")
@@ -1021,13 +1028,21 @@ class SearchEngine:
         start = time.perf_counter()
         success = True
         try:
-            return self.tantivy.search(
+            results = self.tantivy.search(
                 query=query,
                 limit=limit,
                 tags=tags,
                 author=author,
                 path_prefix=path_prefix,
             )
+            logger.info(
+                "full_text_search: query_len=%d limit=%d result_count=%d",
+                len(query),
+                limit,
+                len(results),
+                extra={"query_len": len(query), "limit": limit, "result_count": len(results)},
+            )
+            return results
         except Exception as exc:
             success = False
             logger.error("Full-text search failed: %s", exc)
@@ -1082,7 +1097,7 @@ class SearchEngine:
                         )
                     },
                 )
-            return self.chroma.search(
+            results = self.chroma.search(
                 query=query,
                 limit=limit,
                 threshold=threshold,
@@ -1090,6 +1105,20 @@ class SearchEngine:
                 author=author,
                 path_prefix=path_prefix,
             )
+            logger.info(
+                "semantic_search: query_len=%d limit=%d threshold=%.2f result_count=%d",
+                len(query),
+                limit,
+                threshold,
+                len(results),
+                extra={
+                    "query_len": len(query),
+                    "limit": limit,
+                    "threshold": threshold,
+                    "result_count": len(results),
+                },
+            )
+            return results
         except Exception as exc:
             success = False
             logger.error("Semantic search failed: %s", exc)
@@ -1215,6 +1244,21 @@ class SearchEngine:
                 if len(merged) >= limit:
                     break
 
+            logger.info(
+                "hybrid_search: query_len=%d limit=%d ft_count=%d sem_count=%d merged_count=%d",
+                len(query),
+                limit,
+                len(ft_results),
+                len(sem_results),
+                len(merged),
+                extra={
+                    "query_len": len(query),
+                    "limit": limit,
+                    "ft_count": len(ft_results),
+                    "sem_count": len(sem_results),
+                    "merged_count": len(merged),
+                },
+            )
             return merged
         except SearchBackendError:
             success = False
@@ -1428,6 +1472,21 @@ class SearchEngine:
                     )
                 )
 
+            logger.info(
+                "graph_search: query_len=%d depth=%d seed_count=%d candidate_count=%d result_count=%d",
+                len(query),
+                depth,
+                len(effective_seeds),
+                len(candidate_ids),
+                len(results),
+                extra={
+                    "query_len": len(query),
+                    "depth": depth,
+                    "seed_count": len(effective_seeds),
+                    "candidate_count": len(candidate_ids),
+                    "result_count": len(results),
+                },
+            )
             return results
         except Exception as exc:
             success = False
