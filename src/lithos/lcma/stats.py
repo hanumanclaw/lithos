@@ -506,7 +506,7 @@ class StatsStore:
                     "SELECT id, node_id, trigger_type FROM enrich_queue "
                     "WHERE node_id IS NOT NULL AND processed_at IS NULL"
                 )
-            rows = await cursor.fetchall()
+            rows = list(await cursor.fetchall())
             if not rows:
                 await db.execute("COMMIT")
                 return []
