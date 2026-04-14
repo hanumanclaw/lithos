@@ -1035,7 +1035,7 @@ class SearchEngine:
                 author=author,
                 path_prefix=path_prefix,
             )
-            logger.info(
+            logger.debug(
                 "full_text_search: query_len=%d limit=%d result_count=%d",
                 len(query),
                 limit,
@@ -1105,7 +1105,7 @@ class SearchEngine:
                 author=author,
                 path_prefix=path_prefix,
             )
-            logger.info(
+            logger.debug(
                 "semantic_search: query_len=%d limit=%d threshold=%.2f result_count=%d",
                 len(query),
                 limit,
@@ -1244,7 +1244,7 @@ class SearchEngine:
                 if len(merged) >= limit:
                     break
 
-            logger.info(
+            logger.debug(
                 "hybrid_search: query_len=%d limit=%d ft_count=%d sem_count=%d merged_count=%d",
                 len(query),
                 limit,
@@ -1472,7 +1472,7 @@ class SearchEngine:
                     )
                 )
 
-            logger.info(
+            logger.debug(
                 "graph_search: query_len=%d depth=%d seed_count=%d candidate_count=%d result_count=%d",
                 len(query),
                 depth,

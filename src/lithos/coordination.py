@@ -511,12 +511,14 @@ class CoordinationService:
             await db.commit()
             updated = cursor.rowcount > 0
             if updated:
+                # Derive logical field names from SQL clauses (e.g. "title = ?" -> "title")
+                updated_fields = [clause.split(" = ")[0] for clause in sets]
                 logger.info(
                     "Task updated: task_id=%s agent=%s fields=%s",
                     task_id,
                     agent,
-                    sets,
-                    extra={"task_id": task_id, "agent": agent, "fields": sets},
+                    updated_fields,
+                    extra={"task_id": task_id, "agent": agent, "fields": updated_fields},
                 )
             return updated
 
