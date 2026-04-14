@@ -525,6 +525,18 @@ class EnrichWorker:
         except Exception:
             logger.debug("EnrichWorker: failed to refresh cached counts", exc_info=True)
 
+        total_processed = nodes_succeeded + nodes_failed + tasks_succeeded + tasks_failed
+        _drain_log = logger.info if total_processed > 0 else logger.debug
+        _drain_log(
+            "EnrichWorker: drain completed",
+            extra={
+                "nodes_succeeded": nodes_succeeded,
+                "nodes_failed": nodes_failed,
+                "tasks_succeeded": tasks_succeeded,
+                "tasks_failed": tasks_failed,
+            },
+        )
+
     async def _record_drain_metrics(self, claimed_ids: list[int]) -> None:
         """Record OTEL metrics for successfully processed enrich_queue items."""
         if not _HAS_TELEMETRY:
@@ -553,18 +565,6 @@ class EnrichWorker:
                     _lithos_metrics.lcma_enrich_queue_attempts.record(attempts)
         except Exception:
             logger.debug("EnrichWorker: failed to record drain metrics", exc_info=True)
-
-        total_processed = nodes_succeeded + nodes_failed + tasks_succeeded + tasks_failed
-        _drain_log = logger.info if total_processed > 0 else logger.debug
-        _drain_log(
-            "EnrichWorker: drain completed",
-            extra={
-                "nodes_succeeded": nodes_succeeded,
-                "nodes_failed": nodes_failed,
-                "tasks_succeeded": tasks_succeeded,
-                "tasks_failed": tasks_failed,
-            },
-        )
 
     async def _warn_exhausted(
         self, claimed_ids: list[int], max_attempts: int, *, identifier: str
