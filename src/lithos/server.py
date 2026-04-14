@@ -2689,17 +2689,16 @@ class LithosServer:
 
                 # -- Apply reinforcement side-effects after task is completed --
                 if validated is not None:
-                    if not validated.get("skip"):
-                        logger.info(
-                            "lithos_task_complete: applying feedback reinforcement",
-                            extra={
-                                "task_id": task_id,
-                                "agent": agent,
-                                "cited_count": len(validated.get("cited") or []),
-                                "misleading_count": len(validated.get("misleading") or []),
-                                "ignored_count": len(validated.get("ignored") or []),
-                            },
-                        )
+                    logger.info(
+                        "lithos_task_complete: applying feedback reinforcement",
+                        extra={
+                            "task_id": task_id,
+                            "agent": agent,
+                            "cited_count": len(validated.get("cited") or []),
+                            "misleading_count": len(validated.get("misleading") or []),
+                            "ignored_count": len(validated.get("ignored") or []),
+                        },
+                    )
                     await self._apply_task_feedback(validated)
 
                 await self._emit(

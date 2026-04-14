@@ -461,10 +461,6 @@ class EnrichWorker:
 
         # --- Node-level enrichment ---
         node_entries = await self._stats_store.drain_pending_nodes(max_attempts=max_attempts)
-        logger.info(
-            "EnrichWorker: drain started",
-            extra={"node_count": len(node_entries)},
-        )
         nodes_succeeded = 0
         nodes_failed = 0
         for entry in node_entries:
@@ -553,7 +549,9 @@ class EnrichWorker:
         except Exception:
             logger.debug("EnrichWorker: failed to record drain metrics", exc_info=True)
 
-        logger.info(
+        total_processed = nodes_succeeded + nodes_failed + tasks_succeeded + tasks_failed
+        _drain_log = logger.info if total_processed > 0 else logger.debug
+        _drain_log(
             "EnrichWorker: drain completed",
             extra={
                 "nodes_succeeded": nodes_succeeded,
@@ -591,7 +589,7 @@ class EnrichWorker:
         """
         from lithos.lcma.edges import _project_node_provenance
 
-        logger.info(
+        logger.debug(
             "EnrichWorker: enriching node",
             extra={"node_id": node_id, "trigger_types": list(trigger_types) if isinstance(trigger_types, (list, set, tuple)) else trigger_types},
         )
@@ -686,7 +684,7 @@ class EnrichWorker:
             return
 
         await self._knowledge.update(id=node_id, agent="lithos-enrich", entities=extracted)
-        logger.info(
+        logger.debug(
             "EnrichWorker: entity extraction complete",
             extra={"node_id": node_id, "entity_count": len(extracted)},
         )
