@@ -14,24 +14,32 @@ import pytest
 from lithos.config import LithosConfig, StorageConfig
 from lithos.graph import KnowledgeGraph
 from lithos.knowledge import KnowledgeManager
+from lithos.lcma.edges import EdgeStore
 from lithos.lcma.scouts import (
     ALL_SCOUT_NAMES,
+    SCOUT_COACTIVATION,
     SCOUT_EXACT_ALIAS,
     SCOUT_FRESHNESS,
+    SCOUT_GRAPH,
     SCOUT_LEXICAL,
     SCOUT_PROVENANCE,
+    SCOUT_SOURCE_URL,
     SCOUT_TAGS_RECENCY,
     SCOUT_TASK_CONTEXT,
     SCOUT_VECTOR,
+    scout_coactivation,
     scout_contradictions,
     scout_exact_alias,
     scout_freshness,
+    scout_graph,
     scout_lexical,
     scout_provenance,
+    scout_source_url,
     scout_tags_recency,
     scout_task_context,
     scout_vector,
 )
+from lithos.lcma.stats import StatsStore
 from lithos.search import SearchEngine
 
 
@@ -627,15 +635,507 @@ class TestScoutTaskContext:
 
 
 # ---------------------------------------------------------------------------
-# scout_contradictions (stub)
+# scout_graph
+# ---------------------------------------------------------------------------
+
+_ID7 = "77777777-7777-4777-7777-777777777777"
+
+
+@pytest.fixture
+def graph_with_links(seeded_config: LithosConfig, seeded_km: KnowledgeManager) -> KnowledgeGraph:
+    """KnowledgeGraph where note-1 wiki-links to note-2."""
+    from lithos.knowledge import KnowledgeDocument, KnowledgeMetadata, parse_wiki_links
+
+    graph = KnowledgeGraph(seeded_config)
+    kp = seeded_config.storage.knowledge_path
+
+    # Rewrite note-1 to include a wiki-link to note-2
+    note1 = fm.Post(
+        f"# Note One\n\nSome content linking to [[{_ID2}]]",
+        id=_ID1,
+        title="Note One",
+        author="agent-alpha",
+        created_at=datetime.now(timezone.utc).isoformat(),
+        updated_at=datetime.now(timezone.utc).isoformat(),
+        tags=["testing", "alpha"],
+        aliases=["note-one-alias"],
+        access_scope="shared",
+        namespace="default",
+    )
+    (kp / "note-one.md").write_text(fm.dumps(note1))
+    seeded_km._scan_existing()
+
+    for doc_id, rel_path in seeded_km._id_to_path.items():
+        full_path = kp / rel_path
+        if full_path.exists():
+            post = fm.load(str(full_path))
+            metadata = KnowledgeMetadata.from_dict(dict(post.metadata))
+            doc = KnowledgeDocument(
+                id=doc_id,
+                title=metadata.title,
+                content=post.content,
+                metadata=metadata,
+                path=rel_path,
+                links=parse_wiki_links(post.content),
+            )
+            graph.add_document(doc)
+    return graph
+
+
+@pytest.fixture
+async def seeded_edge_store(seeded_config: LithosConfig) -> EdgeStore:
+    """EdgeStore with some typed edges seeded."""
+    store = EdgeStore(seeded_config)
+    await store.open()
+    # _ID1 -> _ID5 via "related_to" edge with weight 0.8
+    await store.upsert(
+        from_id=_ID1,
+        to_id=_ID5,
+        edge_type="related_to",
+        weight=0.8,
+        namespace="default",
+    )
+    # _ID2 -> _ID6 via "supports" edge with weight 0.6
+    await store.upsert(
+        from_id=_ID2,
+        to_id=_ID6,
+        edge_type="supports",
+        weight=0.6,
+        namespace="default",
+    )
+    return store
+
+
+class TestScoutGraph:
+    async def test_wiki_link_neighbors(
+        self,
+        graph_with_links: KnowledgeGraph,
+        seeded_edge_store: EdgeStore,
+        seeded_km: KnowledgeManager,
+    ) -> None:
+        """Wiki-link from note-1 to note-2 should surface note-2."""
+        candidates = await scout_graph([_ID1], graph_with_links, seeded_edge_store, seeded_km)
+        node_ids = {c.node_id for c in candidates}
+        assert _ID2 in node_ids
+        assert all(c.scouts == [SCOUT_GRAPH] for c in candidates)
+
+    async def test_typed_edge_neighbors(
+        self,
+        seeded_graph: KnowledgeGraph,
+        seeded_edge_store: EdgeStore,
+        seeded_km: KnowledgeManager,
+    ) -> None:
+        """Typed edge from note-1 to note-5 should surface note-5."""
+        candidates = await scout_graph([_ID1], seeded_graph, seeded_edge_store, seeded_km)
+        node_ids = {c.node_id for c in candidates}
+        assert _ID5 in node_ids
+
+    async def test_dedup_wiki_and_edge(
+        self,
+        graph_with_links: KnowledgeGraph,
+        seeded_edge_store: EdgeStore,
+        seeded_km: KnowledgeManager,
+    ) -> None:
+        """Same neighbor via wiki-link and typed edge should appear once."""
+        # Add edge _ID1 -> _ID2 (already wiki-linked)
+        await seeded_edge_store.upsert(
+            from_id=_ID1,
+            to_id=_ID2,
+            edge_type="related_to",
+            weight=0.9,
+            namespace="default",
+        )
+        candidates = await scout_graph([_ID1], graph_with_links, seeded_edge_store, seeded_km)
+        id_counts = [c.node_id for c in candidates].count(_ID2)
+        assert id_counts == 1
+        # Edge weight (0.9) should win over wiki-link (0.5)
+        c2 = next(c for c in candidates if c.node_id == _ID2)
+        assert c2.score == 0.9
+
+    async def test_namespace_filter(
+        self,
+        seeded_graph: KnowledgeGraph,
+        seeded_edge_store: EdgeStore,
+        seeded_km: KnowledgeManager,
+    ) -> None:
+        candidates = await scout_graph(
+            [_ID1],
+            seeded_graph,
+            seeded_edge_store,
+            seeded_km,
+            namespace_filter=["nonexistent"],
+        )
+        assert len(candidates) == 0
+
+    async def test_edge_score_uses_weight(
+        self,
+        seeded_graph: KnowledgeGraph,
+        seeded_edge_store: EdgeStore,
+        seeded_km: KnowledgeManager,
+    ) -> None:
+        """Typed edge neighbor should use the edge weight as score."""
+        candidates = await scout_graph([_ID1], seeded_graph, seeded_edge_store, seeded_km)
+        c5 = next((c for c in candidates if c.node_id == _ID5), None)
+        assert c5 is not None
+        assert c5.score == 0.8
+
+    async def test_excludes_seeds(
+        self,
+        graph_with_links: KnowledgeGraph,
+        seeded_edge_store: EdgeStore,
+        seeded_km: KnowledgeManager,
+    ) -> None:
+        """Seed nodes should not appear in results."""
+        candidates = await scout_graph([_ID1, _ID2], graph_with_links, seeded_edge_store, seeded_km)
+        node_ids = {c.node_id for c in candidates}
+        assert _ID1 not in node_ids
+        assert _ID2 not in node_ids
+
+    async def test_tags_filter(
+        self,
+        seeded_graph: KnowledgeGraph,
+        seeded_edge_store: EdgeStore,
+        seeded_km: KnowledgeManager,
+    ) -> None:
+        candidates = await scout_graph(
+            [_ID1],
+            seeded_graph,
+            seeded_edge_store,
+            seeded_km,
+            tags=["nonexistent-tag"],
+        )
+        assert len(candidates) == 0
+
+
+# ---------------------------------------------------------------------------
+# scout_coactivation
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+async def coactivation_stats_store(
+    seeded_config: LithosConfig, seeded_km: KnowledgeManager
+) -> StatsStore:
+    """StatsStore with seeded coactivation data."""
+    store = StatsStore(seeded_config)
+    await store.open()
+    # _ID1 co-occurs with _ID2 (3x) and _ID5 (1x)
+    for _ in range(3):
+        await store.increment_coactivation(node_a=_ID1, node_b=_ID2, namespace="default")
+    await store.increment_coactivation(node_a=_ID1, node_b=_ID5, namespace="default")
+    return store
+
+
+class TestScoutCoactivation:
+    async def test_returns_coactivated_neighbors(
+        self, coactivation_stats_store: StatsStore, seeded_km: KnowledgeManager
+    ) -> None:
+        candidates = await scout_coactivation([_ID1], coactivation_stats_store, seeded_km)
+        node_ids = {c.node_id for c in candidates}
+        assert _ID2 in node_ids
+        assert _ID5 in node_ids
+        assert all(c.scouts == [SCOUT_COACTIVATION] for c in candidates)
+
+    async def test_scores_by_count(
+        self, coactivation_stats_store: StatsStore, seeded_km: KnowledgeManager
+    ) -> None:
+        candidates = await scout_coactivation([_ID1], coactivation_stats_store, seeded_km)
+        c2 = next(c for c in candidates if c.node_id == _ID2)
+        c5 = next(c for c in candidates if c.node_id == _ID5)
+        assert c2.score > c5.score  # 3 > 1
+
+    async def test_namespace_filter(
+        self, coactivation_stats_store: StatsStore, seeded_km: KnowledgeManager
+    ) -> None:
+        candidates = await scout_coactivation(
+            [_ID1], coactivation_stats_store, seeded_km, namespace_filter=["nonexistent"]
+        )
+        assert len(candidates) == 0
+
+    async def test_namespace_filter_scopes_coactivation_rows(
+        self, seeded_config: LithosConfig, seeded_km: KnowledgeManager
+    ) -> None:
+        """Coactivation rows stored under a different namespace must be excluded
+        even when the candidate note itself lives in the allowed namespace."""
+        store = StatsStore(seeded_config)
+        await store.open()
+        # Record coactivation under namespace "other" — the candidate note (_ID2)
+        # lives in the "default" namespace, but the evidence is from "other".
+        for _ in range(5):
+            await store.increment_coactivation(node_a=_ID1, node_b=_ID2, namespace="other")
+        candidates = await scout_coactivation(
+            [_ID1], store, seeded_km, namespace_filter=["default"]
+        )
+        # _ID2 coactivation data is under "other", so it should NOT surface
+        node_ids = {c.node_id for c in candidates}
+        assert _ID2 not in node_ids
+
+    async def test_empty_seeds(
+        self, coactivation_stats_store: StatsStore, seeded_km: KnowledgeManager
+    ) -> None:
+        candidates = await scout_coactivation([], coactivation_stats_store, seeded_km)
+        assert candidates == []
+
+
+# ---------------------------------------------------------------------------
+# scout_source_url
+# ---------------------------------------------------------------------------
+
+_URL_ID_A = "11111111-1111-4111-1111-111111111111"
+_URL_ID_B = "22222222-2222-4222-2222-222222222222"
+_URL_ID_C = "33333333-3333-4333-3333-333333333333"
+
+
+@pytest.fixture
+def source_url_km(seeded_config: LithosConfig) -> KnowledgeManager:
+    """KnowledgeManager with notes that have source_url fields."""
+    km = KnowledgeManager(seeded_config)
+    kp = seeded_config.storage.knowledge_path
+
+    now = datetime.now(timezone.utc).isoformat()
+
+    note_a = fm.Post(
+        "# Research A\n\nFrom example.com",
+        id=_URL_ID_A,
+        title="Research A",
+        author="agent-alpha",
+        created_at=now,
+        updated_at=now,
+        access_scope="shared",
+        source_url="https://example.com/page1",
+    )
+    (kp / "research-a.md").write_text(fm.dumps(note_a))
+
+    note_b = fm.Post(
+        "# Research B\n\nAlso from example.com",
+        id=_URL_ID_B,
+        title="Research B",
+        author="agent-alpha",
+        created_at=now,
+        updated_at=now,
+        access_scope="shared",
+        source_url="https://example.com/page2",
+    )
+    (kp / "research-b.md").write_text(fm.dumps(note_b))
+
+    note_c = fm.Post(
+        "# Research C\n\nFrom different.org",
+        id=_URL_ID_C,
+        title="Research C",
+        author="agent-alpha",
+        created_at=now,
+        updated_at=now,
+        access_scope="shared",
+        source_url="https://different.org/article",
+    )
+    (kp / "research-c.md").write_text(fm.dumps(note_c))
+
+    km._scan_existing()
+    return km
+
+
+class TestScoutSourceUrl:
+    async def test_finds_same_domain_notes(self, source_url_km: KnowledgeManager) -> None:
+        """Seed A (example.com) should find B (also example.com) but not C (different.org)."""
+        candidates = await scout_source_url([_URL_ID_A], source_url_km)
+        node_ids = {c.node_id for c in candidates}
+        assert _URL_ID_B in node_ids
+        assert _URL_ID_C not in node_ids
+        assert all(c.scouts == [SCOUT_SOURCE_URL] for c in candidates)
+
+    async def test_no_source_url_returns_empty(self, seeded_km: KnowledgeManager) -> None:
+        """Seeds without source_url should return []."""
+        candidates = await scout_source_url([_ID1], seeded_km)
+        assert candidates == []
+
+    async def test_excludes_seeds(self, source_url_km: KnowledgeManager) -> None:
+        candidates = await scout_source_url([_URL_ID_A, _URL_ID_B], source_url_km)
+        node_ids = {c.node_id for c in candidates}
+        assert _URL_ID_A not in node_ids
+        assert _URL_ID_B not in node_ids
+
+    async def test_namespace_filter(self, source_url_km: KnowledgeManager) -> None:
+        candidates = await scout_source_url(
+            [_URL_ID_A], source_url_km, namespace_filter=["nonexistent"]
+        )
+        assert len(candidates) == 0
+
+    async def test_seed_not_owner_in_source_url_index(self, seeded_config: LithosConfig) -> None:
+        """A seed note with source_url that lost the _source_url_to_id slot
+        (due to a collision) must still activate the scout."""
+        _COLLISION_A = "aaaaaaaa-aaaa-4aaa-aaaa-aaaaaaaaaaaa"
+        _COLLISION_B = "bbbbbbbb-bbbb-4bbb-bbbb-bbbbbbbbbbbb"
+        _COLLISION_C = "cccccccc-cccc-4ccc-cccc-cccccccccccc"
+
+        km = KnowledgeManager(seeded_config)
+        kp = seeded_config.storage.knowledge_path
+        now = datetime.now(timezone.utc).isoformat()
+
+        # Note A owns the source_url slot for example.com/same
+        note_a = fm.Post(
+            "# A\n\nContent A",
+            id=_COLLISION_A,
+            title="A",
+            author="agent",
+            created_at=now,
+            updated_at=now,
+            access_scope="shared",
+            source_url="https://example.com/same",
+        )
+        (kp / "coll-a.md").write_text(fm.dumps(note_a))
+
+        # Note B has the same normalized source_url → collision, NOT in index
+        note_b = fm.Post(
+            "# B\n\nContent B",
+            id=_COLLISION_B,
+            title="B",
+            author="agent",
+            created_at=now,
+            updated_at=now,
+            access_scope="shared",
+            source_url="https://example.com/same",
+        )
+        (kp / "coll-b.md").write_text(fm.dumps(note_b))
+
+        # Note C has a different page on the same domain
+        note_c = fm.Post(
+            "# C\n\nContent C",
+            id=_COLLISION_C,
+            title="C",
+            author="agent",
+            created_at=now,
+            updated_at=now,
+            access_scope="shared",
+            source_url="https://example.com/other-page",
+        )
+        (kp / "coll-c.md").write_text(fm.dumps(note_c))
+
+        km._scan_existing()
+
+        # Confirm B is NOT the owner in _source_url_to_id (A is)
+        from lithos.knowledge import normalize_url
+
+        norm = normalize_url("https://example.com/same")
+        assert km._source_url_to_id.get(norm) == _COLLISION_A
+
+        # Use B as seed — it has source_url but is NOT in _source_url_to_id
+        candidates = await scout_source_url([_COLLISION_B], km)
+        node_ids = {c.node_id for c in candidates}
+        # Should still find C (same domain) via B's on-disk source_url
+        assert _COLLISION_C in node_ids
+
+
+# ---------------------------------------------------------------------------
+# scout_contradictions
 # ---------------------------------------------------------------------------
 
 
 class TestScoutContradictions:
     @pytest.mark.asyncio
-    async def test_returns_empty_list(self) -> None:
-        candidates = await scout_contradictions()
-        assert candidates == []
+    async def test_returns_empty_when_no_edges(
+        self, seeded_km: KnowledgeManager, seeded_config: LithosConfig
+    ) -> None:
+        """No contradiction edges → empty list."""
+        edge_store = EdgeStore(seeded_config)
+        await edge_store.open()
+        result = await scout_contradictions([_ID1], edge_store, seeded_km)
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_surfaces_contradiction_edge(
+        self, seeded_km: KnowledgeManager, seeded_config: LithosConfig
+    ) -> None:
+        """Seeded contradiction edge is surfaced."""
+        edge_store = EdgeStore(seeded_config)
+        await edge_store.open()
+        eid = await edge_store.upsert(
+            from_id=_ID1,
+            to_id=_ID2,
+            edge_type="contradicts",
+            weight=1.0,
+            namespace="default",
+        )
+        result = await scout_contradictions([_ID1], edge_store, seeded_km)
+        assert len(result) == 1
+        assert result[0]["edge_id"] == eid
+        assert result[0]["from_id"] == _ID1
+        assert result[0]["to_id"] == _ID2
+        assert result[0]["conflict_state"] is None
+
+    @pytest.mark.asyncio
+    async def test_excludes_resolved_edges(
+        self, seeded_km: KnowledgeManager, seeded_config: LithosConfig
+    ) -> None:
+        """Edges with resolved conflict_state are excluded."""
+        edge_store = EdgeStore(seeded_config)
+        await edge_store.open()
+        for state in ("superseded", "refuted", "merged"):
+            await edge_store.upsert(
+                from_id=_ID1,
+                to_id=_ID2,
+                edge_type="contradicts",
+                weight=1.0,
+                namespace=f"ns-{state}",
+                conflict_state=state,
+            )
+        result = await scout_contradictions([_ID1], edge_store, seeded_km)
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_excludes_different_namespace(
+        self, seeded_km: KnowledgeManager, seeded_config: LithosConfig
+    ) -> None:
+        """Contradiction edge to a note in a different namespace is excluded when filter is set."""
+        edge_store = EdgeStore(seeded_config)
+        await edge_store.open()
+        # _ID1 is in "default" namespace, _ID2 is in "projects" namespace
+        await edge_store.upsert(
+            from_id=_ID1,
+            to_id=_ID2,
+            edge_type="contradicts",
+            weight=1.0,
+            namespace="default",
+        )
+        # Filter to only "default" — _ID2 is in "projects" so should be excluded
+        result = await scout_contradictions(
+            [_ID1], edge_store, seeded_km, namespace_filter=["default"]
+        )
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_excludes_quarantined_note(
+        self, seeded_km: KnowledgeManager, seeded_config: LithosConfig
+    ) -> None:
+        """Contradiction edge pointing to a quarantined note is excluded."""
+        edge_store = EdgeStore(seeded_config)
+        await edge_store.open()
+
+        # Create a quarantined note
+        quarantined_id = "qqqqqqqq-qqqq-4qqq-qqqq-qqqqqqqqqqqq"
+        note = fm.Post(
+            "# Quarantined\n\nBad content",
+            id=quarantined_id,
+            title="Quarantined Note",
+            author="agent-alpha",
+            created_at=datetime.now(timezone.utc).isoformat(),
+            updated_at=datetime.now(timezone.utc).isoformat(),
+            access_scope="shared",
+            namespace="default",
+            status="quarantined",
+        )
+        kp = seeded_config.storage.knowledge_path
+        (kp / "quarantined-note.md").write_text(fm.dumps(note))
+        seeded_km._scan_existing()
+
+        await edge_store.upsert(
+            from_id=_ID1,
+            to_id=quarantined_id,
+            edge_type="contradicts",
+            weight=1.0,
+            namespace="default",
+        )
+        result = await scout_contradictions([_ID1], edge_store, seeded_km)
+        assert result == []
 
 
 # ---------------------------------------------------------------------------
@@ -644,8 +1144,8 @@ class TestScoutContradictions:
 
 
 class TestScoutConstants:
-    def test_all_scout_names_has_seven_entries(self) -> None:
-        assert len(ALL_SCOUT_NAMES) == 7
+    def test_all_scout_names_has_ten_entries(self) -> None:
+        assert len(ALL_SCOUT_NAMES) == 10
 
     def test_canonical_names(self) -> None:
         assert SCOUT_VECTOR == "scout_vector"
@@ -655,6 +1155,9 @@ class TestScoutConstants:
         assert SCOUT_FRESHNESS == "scout_freshness"
         assert SCOUT_PROVENANCE == "scout_provenance"
         assert SCOUT_TASK_CONTEXT == "scout_task_context"
+        assert SCOUT_GRAPH == "scout_graph"
+        assert SCOUT_COACTIVATION == "scout_coactivation"
+        assert SCOUT_SOURCE_URL == "scout_source_url"
 
 
 # ---------------------------------------------------------------------------

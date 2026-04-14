@@ -213,6 +213,26 @@ class TestRerankFast:
         # agent_finding (ID2) should rank first due to higher prior
         assert result[0].node_id == _ID2
 
+    def test_default_priors_differentiate_note_types(self, seeded_km: KnowledgeManager) -> None:
+        """With default priors, agent_finding (0.6) ranks above task_record (0.35)
+        when raw scores are identical."""
+        from dataclasses import replace
+
+        # Override ID1's note_type to task_record in the cache
+        seeded_km._meta_cache[_ID1] = replace(seeded_km._meta_cache[_ID1], note_type="task_record")
+
+        candidates = [
+            Candidate(node_id=_ID1, score=1.0, reasons=["r1"], scouts=["scout_vector"]),
+            Candidate(node_id=_ID2, score=1.0, reasons=["r2"], scouts=["scout_vector"]),
+        ]
+        # Use default LcmaConfig (differentiated priors)
+        result = _rerank_fast(candidates, LcmaConfig(), seeded_km)
+        # agent_finding (0.6) should outrank task_record (0.35)
+        assert result[0].node_id == _ID2
+        assert result[1].node_id == _ID1
+        # Scores must differ
+        assert result[0].score > result[1].score
+
     def test_does_not_mutate_input(self, seeded_km: KnowledgeManager) -> None:
         candidates = [
             Candidate(node_id=_ID1, score=0.5, reasons=["r1"], scouts=["scout_vector"]),
@@ -220,6 +240,88 @@ class TestRerankFast:
         original_score = candidates[0].score
         _rerank_fast(candidates, LcmaConfig(), seeded_km)
         assert candidates[0].score == original_score
+
+    def test_stored_salience_affects_ranking(self, seeded_km: KnowledgeManager) -> None:
+        """When salience_map is provided, higher salience boosts ranking."""
+        # Both candidates have same raw score and same note_type
+        candidates = [
+            Candidate(node_id=_ID1, score=1.0, reasons=["r1"], scouts=["scout_vector"]),
+            Candidate(node_id=_ID2, score=1.0, reasons=["r2"], scouts=["scout_vector"]),
+        ]
+        # Give ID2 much higher salience
+        salience_map = {_ID1: 0.1, _ID2: 0.9}
+        result = _rerank_fast(candidates, LcmaConfig(), seeded_km, salience_map=salience_map)
+        # ID2 should rank first due to higher salience
+        assert result[0].node_id == _ID2
+        assert result[0].score > result[1].score
+
+    def test_salience_map_none_uses_score_as_proxy(self, seeded_km: KnowledgeManager) -> None:
+        """Without salience_map, _rerank_fast falls back to c.score as proxy."""
+        candidates = [
+            Candidate(node_id=_ID1, score=0.3, reasons=["r1"], scouts=["scout_vector"]),
+            Candidate(node_id=_ID2, score=0.9, reasons=["r2"], scouts=["scout_vector"]),
+        ]
+        result_without = _rerank_fast(candidates, LcmaConfig(), seeded_km, salience_map=None)
+        result_default = _rerank_fast(candidates, LcmaConfig(), seeded_km)
+        # Both should produce the same ranking
+        assert result_without[0].node_id == result_default[0].node_id
+        assert result_without[1].node_id == result_default[1].node_id
+
+
+class TestStoredSalienceAffectsRetrieval:
+    """Verify that salience stored in StatsStore flows through run_retrieve."""
+
+    @pytest.mark.asyncio
+    async def test_persisted_salience_affects_run_retrieve_ranking(
+        self,
+        seeded_km: KnowledgeManager,
+        seeded_search: SearchEngine,
+        seeded_graph: KnowledgeGraph,
+        mock_coordination: AsyncMock,
+        edge_store: EdgeStore,
+        stats_store: StatsStore,
+    ) -> None:
+        """Persist different salience values in StatsStore and verify they
+        influence the ranking produced by run_retrieve."""
+        # Give _ID1 a low salience and _ID2 a high salience in StatsStore.
+        # Default salience is 0.5; adjust so _ID1 -> 0.1, _ID2 -> 0.9.
+        await stats_store.update_salience(_ID1, -0.4)  # 0.5 - 0.4 = 0.1
+        await stats_store.update_salience(_ID2, 0.4)  # 0.5 + 0.4 = 0.9
+
+        # Mock search so both IDs come back with equal raw scores, forcing
+        # the salience component to be the differentiator.
+        from lithos.search import SearchResult
+
+        equal_results = [
+            SearchResult(
+                id=_ID1, score=0.5, title="Alpha Note", snippet="alpha", path="alpha-note.md"
+            ),
+            SearchResult(
+                id=_ID2, score=0.5, title="Beta Note", snippet="beta", path="beta-note.md"
+            ),
+        ]
+        with (
+            patch.object(seeded_search, "semantic_search", return_value=equal_results),
+            patch.object(seeded_search, "full_text_search", return_value=equal_results),
+        ):
+            result = await run_retrieve(
+                query="testing",
+                search=seeded_search,
+                knowledge=seeded_km,
+                graph=seeded_graph,
+                coordination=mock_coordination,
+                edge_store=edge_store,
+                stats_store=stats_store,
+                lcma_config=LcmaConfig(),
+                limit=10,
+            )
+
+        result_ids = [r["id"] for r in result["results"]]
+        # Both IDs should appear in results
+        assert _ID1 in result_ids
+        assert _ID2 in result_ids
+        # _ID2 (salience=0.9) should rank above _ID1 (salience=0.1)
+        assert result_ids.index(_ID2) < result_ids.index(_ID1)
 
 
 # ---------------------------------------------------------------------------
@@ -933,8 +1035,374 @@ class TestReceiptFields:
 
 
 # ---------------------------------------------------------------------------
+# Contradiction surfacing through retrieve
+# ---------------------------------------------------------------------------
+
+
+class TestContradictionSurfacing:
+    """US-003: surface_conflicts=True actually surfaces contradictions."""
+
+    @pytest.mark.asyncio
+    async def test_seeded_contradiction_appears_in_result(
+        self,
+        seeded_km: KnowledgeManager,
+        seeded_search: SearchEngine,
+        seeded_graph: KnowledgeGraph,
+        mock_coordination: AsyncMock,
+        edge_store: EdgeStore,
+        stats_store: StatsStore,
+    ) -> None:
+        """A contradiction edge between two notes surfaces in result['conflicts']."""
+        edge_id = await edge_store.upsert(
+            from_id=_ID1,
+            to_id=_ID2,
+            edge_type="contradicts",
+            weight=1.0,
+            namespace="default",
+        )
+
+        from lithos.search import SearchResult
+
+        tantivy_hits = [
+            SearchResult(id=_ID1, title="Alpha Note", snippet="", score=0.9, path="alpha-note.md"),
+            SearchResult(id=_ID2, title="Beta Note", snippet="", score=0.8, path="beta-note.md"),
+        ]
+        with (
+            patch.object(seeded_search, "semantic_search", return_value=[]),
+            patch.object(seeded_search, "full_text_search", return_value=tantivy_hits),
+        ):
+            result = await run_retrieve(
+                query="alpha",
+                search=seeded_search,
+                knowledge=seeded_km,
+                graph=seeded_graph,
+                coordination=mock_coordination,
+                edge_store=edge_store,
+                stats_store=stats_store,
+                lcma_config=LcmaConfig(),
+                limit=10,
+                surface_conflicts=True,
+            )
+
+        assert "conflicts" in result
+        conflicts = result["conflicts"]
+        assert len(conflicts) >= 1  # type: ignore[arg-type]
+        eids = [c["edge_id"] for c in conflicts]  # type: ignore[union-attr]
+        assert edge_id in eids
+
+        # Receipt should also record conflicts_surfaced
+        import aiosqlite
+
+        async with aiosqlite.connect(stats_store.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT conflicts_surfaced FROM receipts WHERE id = ?",
+                (result["receipt_id"],),
+            )
+            row = await cursor.fetchone()
+        assert row is not None
+        surfaced = json.loads(row["conflicts_surfaced"])
+        assert len(surfaced) >= 1
+
+    @pytest.mark.asyncio
+    async def test_surface_conflicts_false_is_noop(
+        self,
+        seeded_km: KnowledgeManager,
+        seeded_search: SearchEngine,
+        seeded_graph: KnowledgeGraph,
+        mock_coordination: AsyncMock,
+        edge_store: EdgeStore,
+        stats_store: StatsStore,
+    ) -> None:
+        """When surface_conflicts=False (default), no conflicts key in result."""
+        await edge_store.upsert(
+            from_id=_ID1,
+            to_id=_ID2,
+            edge_type="contradicts",
+            weight=1.0,
+            namespace="default",
+        )
+
+        from lithos.search import SearchResult
+
+        tantivy_hits = [
+            SearchResult(id=_ID1, title="Alpha Note", snippet="", score=0.9, path="alpha-note.md"),
+        ]
+        with (
+            patch.object(seeded_search, "semantic_search", return_value=[]),
+            patch.object(seeded_search, "full_text_search", return_value=tantivy_hits),
+        ):
+            result = await run_retrieve(
+                query="alpha",
+                search=seeded_search,
+                knowledge=seeded_km,
+                graph=seeded_graph,
+                coordination=mock_coordination,
+                edge_store=edge_store,
+                stats_store=stats_store,
+                lcma_config=LcmaConfig(),
+                limit=10,
+                surface_conflicts=False,
+            )
+
+        assert "conflicts" not in result
+
+
+# ---------------------------------------------------------------------------
 # Finally-block robustness
 # ---------------------------------------------------------------------------
+
+
+class TestNewScoutsWiredInPhaseB:
+    """US-006: graph, coactivation, and source_url scouts fire in Phase B."""
+
+    @pytest.mark.asyncio
+    async def test_graph_scout_fires_with_edges(
+        self,
+        seeded_km: KnowledgeManager,
+        seeded_search: SearchEngine,
+        seeded_graph: KnowledgeGraph,
+        mock_coordination: AsyncMock,
+        edge_store: EdgeStore,
+        stats_store: StatsStore,
+    ) -> None:
+        """When edges.db has edges between notes, scout_graph fires and
+        appears in the receipt's scouts_fired list."""
+        # Create a typed edge from ID1 → ID2
+        await edge_store.upsert(
+            from_id=_ID1,
+            to_id=_ID2,
+            edge_type="related_to",
+            weight=0.8,
+            namespace="default",
+        )
+
+        from lithos.search import SearchResult
+
+        # Phase A returns ID1, so Phase B graph scout can follow the edge to ID2
+        tantivy_hits = [
+            SearchResult(id=_ID1, title="Alpha Note", snippet="", score=0.9, path="alpha-note.md"),
+        ]
+        with (
+            patch.object(seeded_search, "semantic_search", return_value=[]),
+            patch.object(seeded_search, "full_text_search", return_value=tantivy_hits),
+        ):
+            result = await run_retrieve(
+                query="alpha",
+                search=seeded_search,
+                knowledge=seeded_km,
+                graph=seeded_graph,
+                coordination=mock_coordination,
+                edge_store=edge_store,
+                stats_store=stats_store,
+                lcma_config=LcmaConfig(),
+                limit=10,
+            )
+
+        import aiosqlite
+
+        async with aiosqlite.connect(stats_store.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT scouts_fired FROM receipts WHERE id = ?",
+                (result["receipt_id"],),
+            )
+            row = await cursor.fetchone()
+        assert row is not None
+        fired = json.loads(row["scouts_fired"])
+        assert "scout_graph" in fired
+
+        # ID2 should appear in results (found via graph edge from ID1)
+        result_ids = [r["id"] for r in result["results"]]
+        assert _ID2 in result_ids
+
+    @pytest.mark.asyncio
+    async def test_coactivation_scout_fires(
+        self,
+        seeded_km: KnowledgeManager,
+        seeded_search: SearchEngine,
+        seeded_graph: KnowledgeGraph,
+        mock_coordination: AsyncMock,
+        edge_store: EdgeStore,
+        stats_store: StatsStore,
+    ) -> None:
+        """scout_coactivation fires in Phase B when coactivation data exists."""
+        # Seed coactivation data: ID1 co-occurs with ID2
+        await stats_store.increment_coactivation(node_a=_ID1, node_b=_ID2, namespace="default")
+        await stats_store.increment_coactivation(node_a=_ID1, node_b=_ID2, namespace="default")
+
+        from lithos.search import SearchResult
+
+        tantivy_hits = [
+            SearchResult(id=_ID1, title="Alpha Note", snippet="", score=0.9, path="alpha-note.md"),
+        ]
+        with (
+            patch.object(seeded_search, "semantic_search", return_value=[]),
+            patch.object(seeded_search, "full_text_search", return_value=tantivy_hits),
+        ):
+            result = await run_retrieve(
+                query="alpha",
+                search=seeded_search,
+                knowledge=seeded_km,
+                graph=seeded_graph,
+                coordination=mock_coordination,
+                edge_store=edge_store,
+                stats_store=stats_store,
+                lcma_config=LcmaConfig(),
+                limit=10,
+            )
+
+        import aiosqlite
+
+        async with aiosqlite.connect(stats_store.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT scouts_fired FROM receipts WHERE id = ?",
+                (result["receipt_id"],),
+            )
+            row = await cursor.fetchone()
+        assert row is not None
+        fired = json.loads(row["scouts_fired"])
+        assert "scout_coactivation" in fired
+
+        # Verify the coactivated candidate was merged into final results
+        result_ids = [r["id"] for r in result["results"]]
+        assert _ID2 in result_ids
+
+    @pytest.mark.asyncio
+    async def test_source_url_scout_fires(
+        self,
+        seeded_config: LithosConfig,
+        seeded_search: SearchEngine,
+        seeded_graph: KnowledgeGraph,
+        mock_coordination: AsyncMock,
+        edge_store: EdgeStore,
+        stats_store: StatsStore,
+    ) -> None:
+        """scout_source_url fires in Phase B when seed notes share domains."""
+        # Create notes with source_url to test domain grouping
+        km = KnowledgeManager(seeded_config)
+        kp = seeded_config.storage.knowledge_path
+
+        note1 = fm.Post(
+            "# Source A\n\nContent A",
+            id=_ID1,
+            title="Source A",
+            author="agent",
+            created_at=datetime.now(timezone.utc).isoformat(),
+            updated_at=datetime.now(timezone.utc).isoformat(),
+            tags=[],
+            access_scope="shared",
+            note_type="observation",
+            source_url="https://example.com/page1",
+        )
+        (kp / "source-a.md").write_text(fm.dumps(note1))
+
+        note2 = fm.Post(
+            "# Source B\n\nContent B",
+            id=_ID2,
+            title="Source B",
+            author="agent",
+            created_at=datetime.now(timezone.utc).isoformat(),
+            updated_at=datetime.now(timezone.utc).isoformat(),
+            tags=[],
+            access_scope="shared",
+            note_type="observation",
+            source_url="https://example.com/page2",
+        )
+        (kp / "source-b.md").write_text(fm.dumps(note2))
+
+        km._scan_existing()
+
+        from lithos.search import SearchResult
+
+        tantivy_hits = [
+            SearchResult(id=_ID1, title="Source A", snippet="", score=0.9, path="source-a.md"),
+        ]
+        with (
+            patch.object(seeded_search, "semantic_search", return_value=[]),
+            patch.object(seeded_search, "full_text_search", return_value=tantivy_hits),
+        ):
+            result = await run_retrieve(
+                query="source",
+                search=seeded_search,
+                knowledge=km,
+                graph=seeded_graph,
+                coordination=mock_coordination,
+                edge_store=edge_store,
+                stats_store=stats_store,
+                lcma_config=LcmaConfig(),
+                limit=10,
+            )
+
+        import aiosqlite
+
+        async with aiosqlite.connect(stats_store.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT scouts_fired FROM receipts WHERE id = ?",
+                (result["receipt_id"],),
+            )
+            row = await cursor.fetchone()
+        assert row is not None
+        fired = json.loads(row["scouts_fired"])
+        assert "scout_source_url" in fired
+
+        # Verify the same-domain candidate was merged into final results
+        result_ids = [r["id"] for r in result["results"]]
+        assert _ID2 in result_ids
+
+    @pytest.mark.asyncio
+    async def test_failing_phase_b_scout_does_not_abort(
+        self,
+        seeded_km: KnowledgeManager,
+        seeded_search: SearchEngine,
+        seeded_graph: KnowledgeGraph,
+        mock_coordination: AsyncMock,
+        edge_store: EdgeStore,
+        stats_store: StatsStore,
+    ) -> None:
+        """A failing Phase B scout must not abort the pipeline."""
+        from lithos.search import SearchResult
+
+        tantivy_hits = [
+            SearchResult(id=_ID1, title="Alpha Note", snippet="", score=0.9, path="alpha-note.md"),
+        ]
+        with (
+            patch.object(seeded_search, "semantic_search", return_value=[]),
+            patch.object(seeded_search, "full_text_search", return_value=tantivy_hits),
+            patch("lithos.lcma.retrieve.scout_graph", side_effect=RuntimeError("graph boom")),
+        ):
+            result = await run_retrieve(
+                query="alpha",
+                search=seeded_search,
+                knowledge=seeded_km,
+                graph=seeded_graph,
+                coordination=mock_coordination,
+                edge_store=edge_store,
+                stats_store=stats_store,
+                lcma_config=LcmaConfig(),
+                limit=10,
+            )
+
+        # Pipeline still completes and returns results
+        assert result["terrace_reached"] == 1
+        result_ids = [r["id"] for r in result["results"]]
+        assert _ID1 in result_ids
+
+        # The failing scout must NOT appear in scouts_fired
+        import aiosqlite
+
+        async with aiosqlite.connect(stats_store.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT scouts_fired FROM receipts WHERE id = ?",
+                (result["receipt_id"],),
+            )
+            row = await cursor.fetchone()
+        assert row is not None
+        fired = json.loads(row["scouts_fired"])
+        assert "scout_graph" not in fired
 
 
 class TestFinallyBlockRobustness:

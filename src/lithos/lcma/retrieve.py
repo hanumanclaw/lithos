@@ -4,8 +4,9 @@ This module implements the ``lithos_retrieve`` pipeline:
 
 1. **Phase A** — Fire scouts in parallel (vector, lexical, exact_alias,
    tags_recency, freshness, task_context) via ``asyncio.gather``.
-2. **Phase B** — Fire provenance scout sequentially, seeded from top
-   ``max_context_nodes`` of the Phase A normalised pool.
+2. **Phase B** — Fire provenance, graph, coactivation, and source_url scouts
+   sequentially, seeded from top ``max_context_nodes`` of the Phase A
+   normalised pool.
 3. **Merge & Normalise** — ``merge_and_normalize`` produces a unified pool.
 4. **Terrace 1 Rerank** — Diversity (MMR), note-type priors, basic salience.
 5. **Temperature** — Cold-start detection based on edge count.
@@ -24,11 +25,14 @@ from typing import TYPE_CHECKING
 
 from lithos.lcma.scouts import (
     ALL_SCOUT_NAMES,
+    scout_coactivation,
     scout_contradictions,
     scout_exact_alias,
     scout_freshness,
+    scout_graph,
     scout_lexical,
     scout_provenance,
+    scout_source_url,
     scout_tags_recency,
     scout_task_context,
     scout_vector,
@@ -117,8 +121,14 @@ def _rerank_fast(
     candidates: list[Candidate],
     lcma_config: LcmaConfig,
     knowledge: KnowledgeManager,
+    salience_map: dict[str, float] | None = None,
 ) -> list[Candidate]:
-    """Terrace 1 reranking: weighted scout scores, note_type priors, basic salience.
+    """Terrace 1 reranking: weighted scout scores, note_type priors, salience.
+
+    When *salience_map* is provided, actual salience values from StatsStore are
+    used instead of the normalised scout score.  ``salience_map`` maps
+    ``node_id → salience``; nodes absent from the map fall back to 0.5
+    (the StatsStore default).
 
     After the linear combination sort, applies a greedy MMR pass over the top
     candidates to penalise near-duplicates (see checklist MVP 1 requirement for
@@ -146,9 +156,9 @@ def _rerank_fast(
             note_type = getattr(cached, "note_type", None) or "observation"
             note_type_prior = note_type_priors.get(note_type, 0.5)
 
-        # Salience: use normalized score as proxy (actual salience from stats
-        # will be layered in MVP 2 reinforcement)
-        salience = c.score
+        # Salience: read from StatsStore via pre-fetched map when available,
+        # otherwise fall back to normalised score (pre-reinforcement path).
+        salience = salience_map.get(c.node_id, 0.5) if salience_map is not None else c.score
 
         # Final composite: weighted combination
         final = c.score * scout_weight + note_type_prior * 0.1 + salience * 0.1
@@ -243,6 +253,7 @@ async def run_retrieve(
     candidates_considered = 0
     terrace_reached = 0
     temperature: float = lcma_config.temperature_default
+    conflicts_found: list[dict[str, object]] = []
 
     try:
         # ── Phase A: parallel scouts ──────────────────────────────
@@ -299,7 +310,7 @@ async def run_retrieve(
         phase_a_normalised = merge_and_normalize(all_candidates)
         phase_a_normalised.sort(key=lambda c: c.score, reverse=True)
 
-        # ── Phase B: provenance (sequential, seeded from Phase A) ─
+        # ── Phase B: sequential scouts seeded from Phase A ─────────
         seed_ids = [c.node_id for c in phase_a_normalised[:max_context_nodes]]
         if seed_ids:
             try:
@@ -311,8 +322,47 @@ async def run_retrieve(
             except Exception:
                 logger.warning("Phase B (provenance) failed", exc_info=True)
 
-        # Contradictions stub (not counted)
-        await scout_contradictions()
+            try:
+                graph_candidates = await scout_graph(
+                    seed_ids, graph, edge_store, knowledge, limit=limit, **scout_kw
+                )
+                executed_scouts.add("scout_graph")
+                all_candidates.extend(graph_candidates)
+            except Exception:
+                logger.warning("Phase B (graph) failed", exc_info=True)
+
+            try:
+                coact_candidates = await scout_coactivation(
+                    seed_ids, stats_store, knowledge, limit=limit, **scout_kw
+                )
+                executed_scouts.add("scout_coactivation")
+                all_candidates.extend(coact_candidates)
+            except Exception:
+                logger.warning("Phase B (coactivation) failed", exc_info=True)
+
+            try:
+                src_url_candidates = await scout_source_url(
+                    seed_ids, knowledge, limit=limit, **scout_kw
+                )
+                executed_scouts.add("scout_source_url")
+                all_candidates.extend(src_url_candidates)
+            except Exception:
+                logger.warning("Phase B (source_url) failed", exc_info=True)
+
+        # Contradictions — only fire when surface_conflicts is True
+        conflicts_found: list[dict[str, object]] = []
+        if surface_conflicts:
+            try:
+                conflicts_found = await scout_contradictions(
+                    seed_ids,
+                    edge_store,
+                    knowledge,
+                    namespace_filter=namespace_filter,
+                    agent_id=agent_id,
+                    task_id=task_id,
+                )
+            except Exception:
+                logger.warning("Phase B (contradictions) failed", exc_info=True)
 
         # Record scouts_fired using canonical names in order. A scout
         # appears here iff it executed without raising — empty result
@@ -325,7 +375,16 @@ async def run_retrieve(
         candidates_considered = len(merged)
 
         # ── Terrace 1: rerank_fast ────────────────────────────────
-        reranked = _rerank_fast(merged, lcma_config, knowledge)
+        # ── Pre-fetch salience map for reranking ─────��────────────
+        all_node_ids = [c.node_id for c in merged]
+        stats_batch = await stats_store.get_node_stats_batch(all_node_ids)
+        salience_map: dict[str, float] = {}
+        for nid in all_node_ids:
+            stats = stats_batch.get(nid)
+            raw = stats["salience"] if stats else 0.5
+            salience_map[nid] = raw if isinstance(raw, float) else 0.5
+
+        reranked = _rerank_fast(merged, lcma_config, knowledge, salience_map=salience_map)
         terrace_reached = 1
 
         # Apply limit
@@ -385,12 +444,15 @@ async def run_retrieve(
                 except Exception:
                     logger.warning("Working memory upsert failed for %s", r["id"], exc_info=True)
 
-        return {
+        envelope: dict[str, object] = {
             "results": results,
             "temperature": temperature,
             "terrace_reached": terrace_reached,
             "receipt_id": receipt_id,
         }
+        if surface_conflicts:
+            envelope["conflicts"] = conflicts_found
+        return envelope
 
     finally:
         # ── Receipt — always written (even on error) ──────────────
@@ -403,7 +465,7 @@ async def run_retrieve(
                 scouts_fired=scouts_fired,
                 candidates_considered=candidates_considered,
                 final_nodes=final_nodes,
-                conflicts_surfaced=[],
+                conflicts_surfaced=conflicts_found,
                 surface_conflicts=surface_conflicts,
                 temperature=temperature,
                 terrace_reached=terrace_reached,
@@ -418,12 +480,11 @@ async def run_retrieve(
             try:
                 dom_ns = _dominant_namespace(final_node_ids, knowledge)
 
-                # Increment node_stats for every node in final_nodes
-                for nid in final_node_ids:
-                    await stats_store.increment_node_stats(node_id=nid)
+                # Batch-increment node_stats for all final nodes
+                await stats_store.increment_node_stats_batch(final_node_ids)
 
-                # Increment coactivation for every unordered pair
-                for a, b in itertools.combinations(final_node_ids, 2):
-                    await stats_store.increment_coactivation(node_a=a, node_b=b, namespace=dom_ns)
+                # Batch-increment coactivation for all unordered pairs
+                pairs = list(itertools.combinations(final_node_ids, 2))
+                await stats_store.increment_coactivation_batch(pairs, namespace=dom_ns)
             except Exception:
                 logger.warning("Coactivation/node_stats update failed", exc_info=True)

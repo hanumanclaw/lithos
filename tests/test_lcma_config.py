@@ -35,6 +35,15 @@ class TestLcmaConfigDefaults:
         assert cfg.note_type_priors == _DEFAULT_NOTE_TYPE_PRIORS
         assert set(cfg.note_type_priors.keys()) == _LCMA_NOTE_TYPES
 
+    def test_differentiated_note_type_prior_values(self) -> None:
+        cfg = LcmaConfig()
+        assert cfg.note_type_priors["observation"] == 0.5
+        assert cfg.note_type_priors["agent_finding"] == 0.6
+        assert cfg.note_type_priors["summary"] == 0.55
+        assert cfg.note_type_priors["concept"] == 0.45
+        assert cfg.note_type_priors["task_record"] == 0.35
+        assert cfg.note_type_priors["hypothesis"] == 0.5
+
     def test_default_temperature(self) -> None:
         cfg = LcmaConfig()
         assert cfg.temperature_default == 0.5
@@ -52,15 +61,89 @@ class TestLcmaConfigDefaults:
         assert cfg.llm_provider is None
 
 
+class TestLcmaConfigRerankWeights:
+    """rerank_weights 10-scout defaults and backward-compatible fill/renormalize."""
+
+    def test_default_has_10_keys(self) -> None:
+        cfg = LcmaConfig()
+        assert len(cfg.rerank_weights) == 10
+
+    def test_default_sum_to_one(self) -> None:
+        cfg = LcmaConfig()
+        assert abs(sum(cfg.rerank_weights.values()) - 1.0) < 1e-9
+
+    def test_default_key_values(self) -> None:
+        cfg = LcmaConfig()
+        assert cfg.rerank_weights["vector"] == 0.25
+        assert cfg.rerank_weights["graph"] == 0.13
+        assert cfg.rerank_weights["coactivation"] == 0.10
+        assert cfg.rerank_weights["source_url"] == 0.05
+
+    def test_legacy_7_key_config_fills_and_renormalizes(self) -> None:
+        """Old 7-key config gets missing keys filled and renormalized to sum=1.0."""
+        legacy = {
+            "vector": 0.35,
+            "lexical": 0.25,
+            "exact_alias": 0.15,
+            "tags_recency": 0.10,
+            "freshness": 0.05,
+            "provenance": 0.05,
+            "task_context": 0.05,
+        }
+        cfg = LcmaConfig(rerank_weights=legacy)
+        assert len(cfg.rerank_weights) == 10
+        assert "graph" in cfg.rerank_weights
+        assert "coactivation" in cfg.rerank_weights
+        assert "source_url" in cfg.rerank_weights
+        # Sum should be ~1.0 after renormalization
+        assert abs(sum(cfg.rerank_weights.values()) - 1.0) < 1e-9
+        # Relative ordering of original keys preserved
+        assert cfg.rerank_weights["vector"] > cfg.rerank_weights["lexical"]
+
+    def test_unknown_keys_rejected(self) -> None:
+        with pytest.raises(Exception, match="Unknown rerank_weights keys"):
+            LcmaConfig(rerank_weights={"vector": 0.5, "bogus_scout": 0.5})
+
+    def test_all_10_keys_provided_valid(self) -> None:
+        custom = {k: 0.1 for k in _DEFAULT_RERANK_WEIGHTS}
+        cfg = LcmaConfig(rerank_weights=custom)
+        assert len(cfg.rerank_weights) == 10
+        assert all(v == 0.1 for v in cfg.rerank_weights.values())
+
+    def test_all_10_keys_bad_sum_rejected(self) -> None:
+        bad = {k: 0.5 for k in _DEFAULT_RERANK_WEIGHTS}
+        with pytest.raises(Exception, match="rerank_weights must sum"):
+            LcmaConfig(rerank_weights=bad)
+
+    def test_empty_dict_fills_all_defaults(self) -> None:
+        cfg = LcmaConfig(rerank_weights={})
+        assert len(cfg.rerank_weights) == 10
+        assert abs(sum(cfg.rerank_weights.values()) - 1.0) < 1e-9
+
+    def test_missing_keys_non_positive_total_rejected(self) -> None:
+        """Partial map whose filled total is non-positive must be rejected."""
+        negative_legacy = {
+            "vector": -0.25,
+            "lexical": -0.18,
+            "exact_alias": -0.10,
+            "tags_recency": -0.07,
+            "freshness": -0.04,
+            "provenance": -0.04,
+            "task_context": -0.04,
+        }
+        with pytest.raises(Exception, match="rerank_weights sum must be positive"):
+            LcmaConfig(rerank_weights=negative_legacy)
+
+
 class TestLcmaConfigNoteTypePriors:
     """note_type_priors key filling and rejection."""
 
     def test_missing_keys_filled_with_default(self) -> None:
         cfg = LcmaConfig(note_type_priors={"observation": 0.9})
         assert cfg.note_type_priors["observation"] == 0.9
-        # All other keys filled with 0.5
+        # All other keys filled with their differentiated defaults
         for nt in _LCMA_NOTE_TYPES - {"observation"}:
-            assert cfg.note_type_priors[nt] == 0.5
+            assert cfg.note_type_priors[nt] == _DEFAULT_NOTE_TYPE_PRIORS[nt]
         assert len(cfg.note_type_priors) == 6
 
     def test_unknown_keys_rejected(self) -> None:
@@ -124,5 +207,5 @@ class TestLithosConfigLcmaSubtree:
         """MVP 1 functions without any user configuration."""
         cfg = LithosConfig()
         assert cfg.lcma.enabled is True
-        assert len(cfg.lcma.rerank_weights) == 7
+        assert len(cfg.lcma.rerank_weights) == 10
         assert len(cfg.lcma.note_type_priors) == 6

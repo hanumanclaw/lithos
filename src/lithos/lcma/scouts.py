@@ -18,6 +18,7 @@ import logging
 import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
+from urllib.parse import urlparse
 
 from lithos.lcma.utils import Candidate
 
@@ -25,6 +26,8 @@ if TYPE_CHECKING:
     from lithos.coordination import CoordinationService
     from lithos.graph import KnowledgeGraph
     from lithos.knowledge import KnowledgeManager
+    from lithos.lcma.edges import EdgeStore
+    from lithos.lcma.stats import StatsStore
     from lithos.search import SearchEngine
 
 logger = logging.getLogger(__name__)
@@ -37,6 +40,9 @@ SCOUT_TAGS_RECENCY = "scout_tags_recency"
 SCOUT_FRESHNESS = "scout_freshness"
 SCOUT_PROVENANCE = "scout_provenance"
 SCOUT_TASK_CONTEXT = "scout_task_context"
+SCOUT_GRAPH = "scout_graph"
+SCOUT_COACTIVATION = "scout_coactivation"
+SCOUT_SOURCE_URL = "scout_source_url"
 
 ALL_SCOUT_NAMES = [
     SCOUT_VECTOR,
@@ -46,6 +52,9 @@ ALL_SCOUT_NAMES = [
     SCOUT_FRESHNESS,
     SCOUT_PROVENANCE,
     SCOUT_TASK_CONTEXT,
+    SCOUT_GRAPH,
+    SCOUT_COACTIVATION,
+    SCOUT_SOURCE_URL,
 ]
 
 # Keywords that trigger freshness boost
@@ -146,6 +155,8 @@ async def scout_vector(
     for r in results:
         doc_id = r.id
         meta = _get_cached_meta(knowledge, doc_id)
+        if not _passes_status_filter(meta, ["quarantined"]):
+            continue
         ns = meta.namespace if meta else None
         if not _passes_namespace_filter(ns, namespace_filter):
             continue
@@ -198,6 +209,8 @@ async def scout_lexical(
     for r in results:
         doc_id = r.id
         meta = _get_cached_meta(knowledge, doc_id)
+        if not _passes_status_filter(meta, ["quarantined"]):
+            continue
         ns = meta.namespace if meta else None
         if not _passes_namespace_filter(ns, namespace_filter):
             continue
@@ -261,6 +274,8 @@ async def scout_exact_alias(
     candidates: list[Candidate] = []
     for doc_id in found_ids:
         meta = _get_cached_meta(knowledge, doc_id)
+        if not _passes_status_filter(meta, ["quarantined"]):
+            continue
         ns = meta.namespace if meta else None
         if not _passes_namespace_filter(ns, namespace_filter):
             continue
@@ -308,6 +323,7 @@ async def scout_tags_recency(
         tags=tags,
         path_prefix=path_prefix,
         limit=limit * 3,
+        exclude_status=["quarantined"],
     )
     # Sort by updated_at descending (most recent first)
     docs.sort(key=lambda d: d.metadata.updated_at, reverse=True)
@@ -355,6 +371,7 @@ async def scout_freshness(
         tags=tags,
         path_prefix=path_prefix,
         limit=limit * 5,
+        exclude_status=["quarantined"],
     )
     candidates: list[Candidate] = []
     for doc in docs:
@@ -416,6 +433,8 @@ async def scout_provenance(
         if not knowledge.has_document(doc_id):
             continue
         meta = _get_cached_meta(knowledge, doc_id)
+        if not _passes_status_filter(meta, ["quarantined"]):
+            continue
         ns = meta.namespace if meta else None
         if not _passes_namespace_filter(ns, namespace_filter):
             continue
@@ -488,6 +507,8 @@ async def scout_task_context(
         if not knowledge.has_document(doc_id):
             continue
         meta = _get_cached_meta(knowledge, doc_id)
+        if not _passes_status_filter(meta, ["quarantined"]):
+            continue
         ns = meta.namespace if meta else None
         if not _passes_namespace_filter(ns, namespace_filter):
             continue
@@ -516,9 +537,307 @@ async def scout_task_context(
     return candidates
 
 
-async def scout_contradictions() -> list[Candidate]:
-    """Non-counted stub — always returns []. Not included in receipts.scouts_fired."""
-    return []
+async def scout_graph(
+    seed_ids: list[str],
+    graph: KnowledgeGraph,
+    edge_store: EdgeStore,
+    knowledge: KnowledgeManager,
+    *,
+    limit: int = 10,
+    namespace_filter: list[str] | None = None,
+    agent_id: str | None = None,
+    task_id: str | None = None,
+    tags: list[str] | None = None,
+    path_prefix: str | None = None,
+) -> list[Candidate]:
+    """Find neighbors of seed nodes in the wiki-link graph and typed edge graph."""
+    seed_set = set(seed_ids)
+    # Collect (neighbor_id, score, reason) — higher score wins on dedup
+    neighbor_best: dict[str, tuple[float, str]] = {}
+
+    def _track(nid: str, score: float, reason: str) -> None:
+        prev = neighbor_best.get(nid)
+        if prev is None or score > prev[0]:
+            neighbor_best[nid] = (score, reason)
+
+    # 1. Wiki-link graph (NetworkX)
+    for seed_id in seed_ids:
+        link_info = graph.get_links(seed_id, direction="both")
+        for linked in link_info.outgoing:
+            if linked.id not in seed_set:
+                _track(linked.id, 0.5, f"wiki-link from {seed_id[:8]}")
+        for linked in link_info.incoming:
+            if linked.id not in seed_set:
+                _track(linked.id, 0.5, f"wiki-link to {seed_id[:8]}")
+
+    # 2. Typed edge graph (edges.db)
+    for seed_id in seed_ids:
+        outgoing = await edge_store.list_edges(from_id=seed_id)
+        for edge in outgoing:
+            nid = str(edge["to_id"])
+            if nid not in seed_set:
+                raw_w = edge["weight"]
+                w = float(raw_w) if isinstance(raw_w, (int, float)) else 1.0
+                _track(nid, w, f"{edge['type']} edge from {seed_id[:8]}")
+        incoming = await edge_store.list_edges(to_id=seed_id)
+        for edge in incoming:
+            nid = str(edge["from_id"])
+            if nid not in seed_set:
+                raw_w = edge["weight"]
+                w = float(raw_w) if isinstance(raw_w, (int, float)) else 1.0
+                _track(nid, w, f"{edge['type']} edge to {seed_id[:8]}")
+
+    # Sort by score descending, then apply gating
+    ranked = sorted(neighbor_best.items(), key=lambda t: t[1][0], reverse=True)
+    candidates: list[Candidate] = []
+    for nid, (score, reason) in ranked:
+        if not knowledge.has_document(nid):
+            continue
+        meta = _get_cached_meta(knowledge, nid)
+        if not _passes_status_filter(meta, ["quarantined"]):
+            continue
+        ns = meta.namespace if meta else None
+        if not _passes_namespace_filter(ns, namespace_filter):
+            continue
+        if not _passes_access_scope(
+            meta.access_scope if meta else None,
+            meta.author if meta else None,
+            meta.source if meta else None,
+            agent_id,
+            task_id,
+        ):
+            continue
+        if not _passes_tags_filter(meta.tags if meta else None, tags):
+            continue
+        if not _passes_path_prefix(meta.path if meta else None, path_prefix):
+            continue
+        candidates.append(
+            Candidate(
+                node_id=nid,
+                score=score,
+                reasons=[reason],
+                scouts=[SCOUT_GRAPH],
+            )
+        )
+        if len(candidates) >= limit:
+            break
+    return candidates
+
+
+async def scout_coactivation(
+    seed_ids: list[str],
+    stats_store: StatsStore,
+    knowledge: KnowledgeManager,
+    *,
+    limit: int = 10,
+    namespace_filter: list[str] | None = None,
+    agent_id: str | None = None,
+    task_id: str | None = None,
+    tags: list[str] | None = None,
+    path_prefix: str | None = None,
+) -> list[Candidate]:
+    """Find nodes frequently co-occurring with seed nodes in past retrievals."""
+    if not seed_ids:
+        return []
+
+    # When namespace_filter is set, scope coactivation queries per-namespace
+    # to avoid leaking cross-namespace coactivation evidence.
+    if namespace_filter:
+        merged: dict[str, int] = {}
+        for ns in namespace_filter:
+            for node_id, count in await stats_store.get_coactivated(
+                seed_ids, namespace=ns, limit=limit * 3
+            ):
+                merged[node_id] = merged.get(node_id, 0) + count
+        coactivated = sorted(merged.items(), key=lambda t: t[1], reverse=True)[: limit * 3]
+    else:
+        coactivated = await stats_store.get_coactivated(seed_ids, limit=limit * 3)
+
+    candidates: list[Candidate] = []
+    for node_id, count in coactivated:
+        if not knowledge.has_document(node_id):
+            continue
+        meta = _get_cached_meta(knowledge, node_id)
+        if not _passes_status_filter(meta, ["quarantined"]):
+            continue
+        ns = meta.namespace if meta else None
+        if not _passes_namespace_filter(ns, namespace_filter):
+            continue
+        if not _passes_access_scope(
+            meta.access_scope if meta else None,
+            meta.author if meta else None,
+            meta.source if meta else None,
+            agent_id,
+            task_id,
+        ):
+            continue
+        if not _passes_tags_filter(meta.tags if meta else None, tags):
+            continue
+        if not _passes_path_prefix(meta.path if meta else None, path_prefix):
+            continue
+        candidates.append(
+            Candidate(
+                node_id=node_id,
+                score=float(count),
+                reasons=[f"coactivated {count} times with seeds"],
+                scouts=[SCOUT_COACTIVATION],
+            )
+        )
+        if len(candidates) >= limit:
+            break
+    return candidates
+
+
+def _extract_domain(normalized_url: str) -> str | None:
+    """Extract the hostname from a normalized URL."""
+    try:
+        parsed = urlparse(normalized_url)
+        return parsed.hostname or None
+    except Exception:
+        return None
+
+
+async def scout_source_url(
+    seed_ids: list[str],
+    knowledge: KnowledgeManager,
+    *,
+    limit: int = 10,
+    namespace_filter: list[str] | None = None,
+    agent_id: str | None = None,
+    task_id: str | None = None,
+    tags: list[str] | None = None,
+    path_prefix: str | None = None,
+) -> list[Candidate]:
+    """Find notes from the same URL domain as seed notes."""
+    seed_set = set(seed_ids)
+    url_map = knowledge._source_url_to_id
+
+    # 1. Collect domains from seed notes using the in-memory metadata cache
+    #    (avoids synchronous disk I/O from frontmatter parsing). This handles
+    #    both URL owners and non-owners in the _source_url_to_id map.
+    seed_domains: set[str] = set()
+    for seed_id in seed_ids:
+        cached = knowledge._meta_cache.get(seed_id)
+        if cached and cached.source_url:
+            domain = _extract_domain(cached.source_url)
+            if domain:
+                seed_domains.add(domain)
+
+    if not seed_domains:
+        return []
+
+    # 2. Find all notes with matching domains (excluding seeds)
+    matches: list[str] = []
+    for norm_url, doc_id in url_map.items():
+        if doc_id in seed_set:
+            continue
+        domain = _extract_domain(norm_url)
+        if domain and domain in seed_domains:
+            matches.append(doc_id)
+
+    # 3. Apply gating and build candidates
+    candidates: list[Candidate] = []
+    for doc_id in matches:
+        if not knowledge.has_document(doc_id):
+            continue
+        meta = _get_cached_meta(knowledge, doc_id)
+        if not _passes_status_filter(meta, ["quarantined"]):
+            continue
+        ns = meta.namespace if meta else None
+        if not _passes_namespace_filter(ns, namespace_filter):
+            continue
+        if not _passes_access_scope(
+            meta.access_scope if meta else None,
+            meta.author if meta else None,
+            meta.source if meta else None,
+            agent_id,
+            task_id,
+        ):
+            continue
+        if not _passes_tags_filter(meta.tags if meta else None, tags):
+            continue
+        if not _passes_path_prefix(meta.path if meta else None, path_prefix):
+            continue
+        candidates.append(
+            Candidate(
+                node_id=doc_id,
+                score=1.0,
+                reasons=["same source URL domain"],
+                scouts=[SCOUT_SOURCE_URL],
+            )
+        )
+        if len(candidates) >= limit:
+            break
+    return candidates
+
+
+async def scout_contradictions(
+    seed_ids: list[str],
+    edge_store: EdgeStore,
+    knowledge: KnowledgeManager,
+    *,
+    namespace_filter: list[str] | None = None,
+    agent_id: str | None = None,
+    task_id: str | None = None,
+) -> list[dict[str, object]]:
+    """Query contradiction edges connected to seed nodes.
+
+    Returns a list of dicts with edge_id, from_id, to_id, and conflict_state
+    for edges where conflict_state is NULL or not in a resolved terminal state.
+    """
+    _RESOLVED_STATES = {"superseded", "refuted", "merged"}
+    seen_edge_ids: set[str] = set()
+    results: list[dict[str, object]] = []
+
+    for node_id in seed_ids:
+        outgoing = await edge_store.list_edges(from_id=node_id, edge_type="contradicts")
+        incoming = await edge_store.list_edges(to_id=node_id, edge_type="contradicts")
+
+        for edge in [*outgoing, *incoming]:
+            eid = str(edge["edge_id"])
+            if eid in seen_edge_ids:
+                continue
+            seen_edge_ids.add(eid)
+
+            conflict_state = edge["conflict_state"]
+            if isinstance(conflict_state, str) and conflict_state in _RESOLVED_STATES:
+                continue
+
+            # Determine the counterpart note (the one that isn't the current seed)
+            from_id = str(edge["from_id"])
+            to_id = str(edge["to_id"])
+            counterpart_id = to_id if from_id == node_id else from_id
+
+            # Verify counterpart exists
+            if not knowledge.has_document(counterpart_id):
+                continue
+
+            # Apply gating filters on the counterpart
+            meta = _get_cached_meta(knowledge, counterpart_id)
+            if not _passes_status_filter(meta, ["quarantined"]):
+                continue
+            ns = meta.namespace if meta else None
+            if not _passes_namespace_filter(ns, namespace_filter):
+                continue
+            if not _passes_access_scope(
+                meta.access_scope if meta else None,
+                meta.author if meta else None,
+                meta.source if meta else None,
+                agent_id,
+                task_id,
+            ):
+                continue
+
+            results.append(
+                {
+                    "edge_id": eid,
+                    "from_id": from_id,
+                    "to_id": to_id,
+                    "conflict_state": conflict_state,
+                }
+            )
+
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -536,6 +855,17 @@ class _CachedMetaView:
     source: str | None
     tags: list[str]
     path: object  # Path, but kept loose to avoid an import cycle
+    status: str | None = None
+
+
+def _passes_status_filter(
+    view: _CachedMetaView | None,
+    exclude_status: list[str] | None = None,
+) -> bool:
+    """Return False when the view's status is in the exclusion list."""
+    if exclude_status is None or view is None:
+        return True
+    return view.status not in exclude_status
 
 
 def _get_cached_meta(knowledge: KnowledgeManager, doc_id: str) -> _CachedMetaView | None:
@@ -554,4 +884,5 @@ def _get_cached_meta(knowledge: KnowledgeManager, doc_id: str) -> _CachedMetaVie
         source=cached.source,
         tags=list(cached.tags),
         path=cached.path,
+        status=cached.status,
     )

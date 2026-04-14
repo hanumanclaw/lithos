@@ -15,16 +15,26 @@ _LCMA_NOTE_TYPES = frozenset(
 
 # Default rerank weights keyed by scout name (minus scout_ prefix)
 _DEFAULT_RERANK_WEIGHTS: dict[str, float] = {
-    "vector": 0.35,
-    "lexical": 0.25,
-    "exact_alias": 0.15,
-    "tags_recency": 0.10,
-    "freshness": 0.05,
-    "provenance": 0.05,
-    "task_context": 0.05,
+    "vector": 0.25,
+    "lexical": 0.18,
+    "exact_alias": 0.10,
+    "tags_recency": 0.07,
+    "freshness": 0.04,
+    "provenance": 0.04,
+    "task_context": 0.04,
+    "graph": 0.13,
+    "coactivation": 0.10,
+    "source_url": 0.05,
 }
 
-_DEFAULT_NOTE_TYPE_PRIORS: dict[str, float] = {nt: 0.5 for nt in sorted(_LCMA_NOTE_TYPES)}
+_DEFAULT_NOTE_TYPE_PRIORS: dict[str, float] = {
+    "agent_finding": 0.6,
+    "concept": 0.45,
+    "hypothesis": 0.5,
+    "observation": 0.5,
+    "summary": 0.55,
+    "task_record": 0.35,
+}
 
 
 class ServerConfig(BaseModel):
@@ -142,7 +152,48 @@ class LcmaConfig(BaseModel):
     temperature_default: float = 0.5
     temperature_edge_threshold: int = 50
     wm_eviction_days: int = 7
+    max_enrich_attempts: int = 3
+    decay_inactive_days: int = 7
+    sweep_interval_hours: int = 24
+    sweep_startup_delay_minutes: int = 10
     llm_provider: str | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _fill_and_renormalize_rerank_weights(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        weights = data.get("rerank_weights")
+        if weights is None:
+            return data
+        if not isinstance(weights, dict):
+            return data
+        valid_keys = set(_DEFAULT_RERANK_WEIGHTS.keys())
+        # Reject unknown keys
+        unknown = set(weights.keys()) - valid_keys
+        if unknown:
+            raise ValueError(
+                f"Unknown rerank_weights keys: {sorted(unknown)}. "
+                f"Allowed keys: {sorted(valid_keys)}"
+            )
+        # Fill missing keys with defaults and renormalize
+        missing = valid_keys - set(weights.keys())
+        if missing:
+            for key in missing:
+                weights[key] = _DEFAULT_RERANK_WEIGHTS[key]
+            total = sum(weights.values())
+            if total <= 0:
+                raise ValueError(
+                    f"rerank_weights sum must be positive after filling missing keys, got {total:.4f}"
+                )
+            weights = {k: v / total for k, v in weights.items()}
+        else:
+            # All keys present — assert sum ≈ 1.0
+            total = sum(weights.values())
+            if abs(total - 1.0) > 0.01:
+                raise ValueError(f"rerank_weights must sum to ~1.0, got {total:.4f}")
+        data["rerank_weights"] = weights
+        return data
 
     @model_validator(mode="before")
     @classmethod
@@ -161,10 +212,10 @@ class LcmaConfig(BaseModel):
                 f"Unknown note_type_priors keys: {sorted(unknown)}. "
                 f"Allowed keys: {sorted(_LCMA_NOTE_TYPES)}"
             )
-        # Fill missing keys with default 0.5
+        # Fill missing keys with differentiated defaults
         for nt in _LCMA_NOTE_TYPES:
             if nt not in priors:
-                priors[nt] = 0.5
+                priors[nt] = _DEFAULT_NOTE_TYPE_PRIORS[nt]
         data["note_type_priors"] = priors
         return data
 

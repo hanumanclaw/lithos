@@ -195,6 +195,57 @@ class EdgeStore:
             await db.commit()
         return edge_id
 
+    async def get_edge(self, edge_id: str) -> dict[str, object] | None:
+        """Return a single edge by its ID, or ``None`` if not found."""
+        await self._ensure_open()
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT edge_id, from_id, to_id, type, weight, namespace, "
+                "created_at, updated_at, provenance_actor, provenance_type, "
+                "evidence, conflict_state FROM edges WHERE edge_id = ?",
+                (edge_id,),
+            )
+            row = await cursor.fetchone()
+        if row is None:
+            return None
+        return {
+            "edge_id": row["edge_id"],
+            "from_id": row["from_id"],
+            "to_id": row["to_id"],
+            "type": row["type"],
+            "weight": row["weight"],
+            "namespace": row["namespace"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+            "provenance_actor": row["provenance_actor"],
+            "provenance_type": row["provenance_type"],
+            "evidence": row["evidence"],
+            "conflict_state": row["conflict_state"],
+        }
+
+    async def update_conflict_resolution(
+        self,
+        edge_id: str,
+        *,
+        conflict_state: str,
+        provenance_actor: str,
+    ) -> bool:
+        """Update conflict_state and provenance_actor on an existing edge.
+
+        Returns ``True`` if the edge was found and updated, ``False`` otherwise.
+        """
+        await self._ensure_open()
+        now = datetime.now(timezone.utc).isoformat()
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                "UPDATE edges SET conflict_state = ?, provenance_actor = ?, updated_at = ? "
+                "WHERE edge_id = ?",
+                (conflict_state, provenance_actor, now, edge_id),
+            )
+            await db.commit()
+            return cursor.rowcount > 0
+
     async def list_edges(
         self,
         *,
@@ -272,6 +323,124 @@ class EdgeStore:
             )
             await db.commit()
             return cursor.rowcount
+
+    async def adjust_weight(self, edge_id: str, delta: float) -> float | None:
+        """Atomically adjust weight by *delta*, clamping to [0.0, 1.0].
+
+        Returns the new weight, or ``None`` if the edge is not found.
+        """
+        await self._ensure_open()
+        now = datetime.now(timezone.utc).isoformat()
+        async with aiosqlite.connect(self.db_path) as db:
+            # Single atomic UPDATE with clamping in SQL — no read-modify-write race.
+            cursor = await db.execute(
+                "UPDATE edges SET weight = MAX(0.0, MIN(1.0, weight + ?)), updated_at = ? "
+                "WHERE edge_id = ?",
+                (delta, now, edge_id),
+            )
+            if cursor.rowcount == 0:
+                return None
+            await db.commit()
+            cursor = await db.execute("SELECT weight FROM edges WHERE edge_id = ?", (edge_id,))
+            row = await cursor.fetchone()
+        assert row is not None
+        return row[0]
+
+    async def list_edges_between(
+        self,
+        node_ids: list[str],
+        *,
+        edge_type: str | None = None,
+        namespace: str | None = None,
+    ) -> list[dict[str, object]]:
+        """Return all edges where both from_id and to_id are in *node_ids*."""
+        await self._ensure_open()
+        if not node_ids:
+            return []
+        placeholders = ", ".join("?" for _ in node_ids)
+        clauses = [
+            f"from_id IN ({placeholders})",
+            f"to_id IN ({placeholders})",
+        ]
+        params: list[object] = [*node_ids, *node_ids]
+        if edge_type is not None:
+            clauses.append("type = ?")
+            params.append(edge_type)
+        if namespace is not None:
+            clauses.append("namespace = ?")
+            params.append(namespace)
+        where = " AND ".join(clauses)
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(f"SELECT * FROM edges WHERE {where}", params)
+            rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
+
+async def _project_node_provenance(
+    edge_store: EdgeStore,
+    knowledge: KnowledgeManager,
+    node_id: str,
+) -> dict[str, int]:
+    """Project provenance for a single node into edges.db.
+
+    When the node exists in ``knowledge``:
+      - Reads ``derived_from_ids`` via ``get_doc_sources(node_id)``
+      - Upserts ``type='derived_from'`` edges for each source
+      - Removes orphan ``derived_from`` edges that no longer match frontmatter
+
+    When the node is absent (deleted):
+      - Deletes all ``derived_from`` edges where ``from_id == node_id``
+
+    Returns ``{"created": N, "removed": M}`` summarising the delta.
+    """
+    if not edge_store.db_path.exists():
+        return {"created": 0, "removed": 0}
+
+    # Read existing derived_from edges where from_id == node_id
+    existing_edges = await edge_store.list_edges(from_id=node_id, edge_type="derived_from")
+    existing_map: dict[tuple[str, str], str] = {}
+    for e in existing_edges:
+        key = (str(e["to_id"]), str(e["namespace"]))
+        existing_map[key] = str(e["edge_id"])
+
+    # Node absent — remove all derived_from edges
+    if not knowledge.has_document(node_id):
+        if existing_edges:
+            edge_ids = [str(e["edge_id"]) for e in existing_edges]
+            await edge_store.delete_edges(edge_ids=edge_ids)
+        return {"created": 0, "removed": len(existing_edges)}
+
+    # Node exists — build desired set
+    sources = knowledge.get_doc_sources(node_id)
+    cached = knowledge._meta_cache.get(node_id)
+    ns = cached.namespace if cached else "default"
+
+    desired: set[tuple[str, str]] = set()
+    for source_id in sources:
+        desired.add((source_id, ns))
+
+    existing_keys = set(existing_map.keys())
+    to_create = desired - existing_keys
+    to_remove = existing_keys - desired
+
+    # Upsert all desired edges (not just new ones) so that stale metadata
+    # on pre-existing edges is resynced to canonical values.
+    for to_id, namespace in desired:
+        await edge_store.upsert(
+            from_id=node_id,
+            to_id=to_id,
+            edge_type="derived_from",
+            weight=1.0,
+            namespace=namespace,
+            provenance_type="frontmatter",
+        )
+
+    orphan_ids = [existing_map[k] for k in to_remove]
+    if orphan_ids:
+        await edge_store.delete_edges(edge_ids=orphan_ids)
+
+    return {"created": len(to_create), "removed": len(to_remove)}
 
 
 async def _project_provenance_to_edges(

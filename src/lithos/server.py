@@ -44,6 +44,7 @@ from lithos.knowledge import (
     KnowledgeManager,
     _UnsetType,
 )
+from lithos.lcma.migrations import MigrationRegistry, run_migrations
 from lithos.search import SearchEngine
 from lithos.telemetry import (
     StatusCode,
@@ -82,10 +83,22 @@ class LithosServer:
         self.event_bus = EventBus(self._config.events)
 
         from lithos.lcma.edges import EdgeStore
+        from lithos.lcma.enrich import EnrichWorker
         from lithos.lcma.stats import StatsStore
 
         self.edge_store = EdgeStore(self._config)
         self.stats_store = StatsStore(self._config)
+
+        self._enrich_worker: EnrichWorker | None = None
+        if self._config.lcma.enabled:
+            self._enrich_worker = EnrichWorker(
+                config=self._config.lcma,
+                event_bus=self.event_bus,
+                stats_store=self.stats_store,
+                edge_store=self.edge_store,
+                knowledge=self.knowledge,
+                coordination=self.coordination,
+            )
 
         # Cached count fields for synchronous OTEL observable gauge callbacks
         self._cached_active_claims: int = 0
@@ -132,6 +145,122 @@ class LithosServer:
             await self.event_bus.emit(event)
         except Exception:
             logger.exception("Failed to emit %s event", event.type)
+
+    async def _validate_task_feedback(
+        self,
+        *,
+        task_id: str,
+        agent: str,
+        cited_nodes: list[str] | None,
+        misleading_nodes: list[str] | None,
+        receipt_id: str | None,
+    ) -> tuple[dict[str, Any], None] | tuple[None, dict[str, Any]]:
+        """Validate receipt and compute filtered node sets without side effects.
+
+        Returns ``(error_envelope, None)`` on hard failure, or
+        ``(None, validated_data)`` on success.  ``validated_data`` contains the
+        keys ``cited``, ``misleading``, ``ignored`` (each a list[str] or None)
+        and ``skip`` (bool — True when feedback should be silently dropped).
+        """
+        # -- Resolve receipt --
+        receipt: dict[str, object] | None
+        if receipt_id is not None:
+            receipt = await self.stats_store.get_receipt(receipt_id, task_id)
+            if receipt is None:
+                return (
+                    {
+                        "status": "error",
+                        "code": "receipt_not_found",
+                        "message": (
+                            f"Receipt '{receipt_id}' not found or does not "
+                            f"belong to task '{task_id}'."
+                        ),
+                    },
+                    None,
+                )
+        else:
+            receipt = await self.stats_store.get_latest_receipt(task_id, agent)
+            if receipt is None:
+                logger.warning(
+                    "No receipt found for task=%s agent=%s — dropping all feedback",
+                    task_id,
+                    agent,
+                )
+                return (None, {"skip": True, "cited": None, "misleading": None, "ignored": []})
+
+        receipt_node_ids: set[str] = set()
+        raw_ids = receipt.get("final_node_ids")
+        if isinstance(raw_ids, list):
+            receipt_node_ids = {str(nid) for nid in raw_ids}
+
+        # -- Intersect with receipt node IDs --
+        cited = list(receipt_node_ids & set(cited_nodes)) if cited_nodes is not None else None
+        misleading = (
+            list(receipt_node_ids & set(misleading_nodes)) if misleading_nodes is not None else None
+        )
+
+        # Log dropped IDs
+        if cited_nodes is not None:
+            dropped = set(cited_nodes) - receipt_node_ids
+            for nid in dropped:
+                logger.debug("Dropped cited node %s — not in receipt", nid)
+        if misleading_nodes is not None:
+            dropped = set(misleading_nodes) - receipt_node_ids
+            for nid in dropped:
+                logger.debug("Dropped misleading node %s — not in receipt", nid)
+
+        # -- Intersect with existing knowledge (prevent writes for deleted notes) --
+        existing_ids: set[str] = set()
+        for nid in receipt_node_ids:
+            if nid in self.knowledge._meta_cache:
+                existing_ids.add(nid)
+
+        if cited is not None:
+            cited = [nid for nid in cited if nid in existing_ids]
+        if misleading is not None:
+            misleading = [nid for nid in misleading if nid in existing_ids]
+
+        # -- Compute ignored: receipt nodes not in cited or misleading --
+        cited_set = set(cited) if cited is not None else set()
+        misleading_set = set(misleading) if misleading is not None else set()
+        ignored = [
+            nid
+            for nid in receipt_node_ids
+            if nid not in cited_set and nid not in misleading_set and nid in existing_ids
+        ]
+
+        return (
+            None,
+            {"skip": False, "cited": cited, "misleading": misleading, "ignored": ignored},
+        )
+
+    async def _apply_task_feedback(self, validated: dict[str, Any]) -> None:
+        """Apply reinforcement side-effects using pre-validated data."""
+        from lithos.lcma.reinforcement import (
+            penalize_ignored,
+            penalize_misleading,
+            reinforce_cited_nodes,
+            reinforce_edges_between,
+            weaken_edges_for_bad_context,
+        )
+
+        if validated.get("skip"):
+            return
+
+        cited = validated["cited"]
+        misleading = validated["misleading"]
+        ignored = validated["ignored"]
+
+        if cited is not None and cited:
+            await reinforce_cited_nodes(cited, self.edge_store, self.stats_store, self.knowledge)
+            await reinforce_edges_between(cited, self.edge_store, self.knowledge)
+
+        if misleading is not None and misleading:
+            await penalize_misleading(misleading, self.stats_store, self.knowledge)
+            await weaken_edges_for_bad_context(misleading, self.edge_store)
+
+        if ignored:
+            await penalize_ignored(ignored, self.stats_store)
 
     async def _get_health(self) -> dict[str, Any]:
         """Run health checks and return a status dict (shared by HTTP and any callers)."""
@@ -389,6 +518,14 @@ class LithosServer:
                 # Ensure directories exist
                 self.config.ensure_directories()
 
+                # Initialize and run schema migrations
+                registry_path = (
+                    self.config.storage.lithos_store_path / "migrations" / "registry.json"
+                )
+                migration_registry = MigrationRegistry(registry_path)
+                migration_registry.initialize()
+                run_migrations(self.knowledge, migration_registry)
+
                 # Initialize coordination database
                 await self.coordination.initialize()
 
@@ -440,6 +577,15 @@ class LithosServer:
                     task = asyncio.create_task(self._prewarm_embeddings())
                     self._background_tasks.add(task)
                     task.add_done_callback(self._background_tasks.discard)
+
+                # Ensure edge store is open before the enrich worker
+                # starts — projection helpers no-op when edges.db is absent.
+                if self._config.lcma.enabled:
+                    await self.edge_store.open()
+
+                # Start enrichment worker when LCMA is enabled
+                if self._enrich_worker is not None:
+                    await self._enrich_worker.start()
 
             except Exception as exc:
                 span.record_exception(exc)
@@ -592,6 +738,11 @@ class LithosServer:
             self._observer.join()
             self._observer = None
 
+    async def stop_enrich_worker(self) -> None:
+        """Stop the enrichment background worker."""
+        if self._enrich_worker is not None:
+            await self._enrich_worker.stop()
+
     async def handle_file_change(self, path: Path, deleted: bool = False) -> None:
         """Handle a file change event."""
         if path.suffix != ".md":
@@ -611,18 +762,19 @@ class LithosServer:
                     if deleted:
                         doc_id = self.knowledge.get_id_by_path(relative_path)
                         if doc_id:
-                            await self.knowledge.delete(doc_id)
-                            self.search.remove_document(doc_id)
-                            self.graph.remove_document(doc_id)
-                            self.graph.save_cache()
-
+                            # Emit event with doc id before delete evicts _meta_cache
                             lithos_metrics.file_watcher_events.add(1, {"event_type": "deleted"})
                             await self._emit(
                                 LithosEvent(
                                     type=NOTE_DELETED,
-                                    payload={"path": str(relative_path)},
+                                    payload={"id": doc_id, "path": str(relative_path)},
                                 )
                             )
+
+                            await self.knowledge.delete(doc_id)
+                            self.search.remove_document(doc_id)
+                            self.graph.remove_document(doc_id)
+                            self.graph.save_cache()
                     else:
                         is_new = not self.knowledge.get_id_by_path(relative_path)
                         doc = await self.knowledge.sync_from_disk(relative_path)
@@ -634,7 +786,7 @@ class LithosServer:
                         lithos_metrics.file_watcher_events.add(1, {"event_type": event_type})
                         await self._emit(
                             LithosEvent(
-                                type=NOTE_UPDATED,
+                                type=NOTE_CREATED if is_new else NOTE_UPDATED,
                                 payload={"path": str(relative_path)},
                             )
                         )
@@ -1516,6 +1668,127 @@ class LithosServer:
 
         @self.mcp.tool()
         @tool_metrics()
+        async def lithos_conflict_resolve(
+            edge_id: str,
+            resolution: str,
+            resolver: str,
+            winner_id: str | None = None,
+        ) -> dict[str, Any]:
+            """Resolve a contradiction between two notes.
+
+            Sets the resolution state on a contradicts edge so future retrieval
+            reflects the resolution.
+
+            Args:
+                edge_id: The edge ID of the contradiction to resolve
+                resolution: One of: accepted_dual, superseded, refuted, merged
+                resolver: Agent or user identifier performing the resolution
+                winner_id: Required when resolution is 'superseded'; must be
+                    either from_id or to_id of the edge
+            """
+            logger.info(
+                "lithos_conflict_resolve edge_id=%s resolution=%s resolver=%s",
+                edge_id,
+                resolution,
+                resolver,
+            )
+            tracer = get_tracer()
+            with tracer.start_as_current_span("lithos.tool.conflict_resolve") as span:
+                span.set_attribute("lithos.tool", "lithos_conflict_resolve")
+
+                valid_resolutions = {"accepted_dual", "superseded", "refuted", "merged"}
+                if resolution not in valid_resolutions:
+                    return {
+                        "status": "error",
+                        "code": "invalid_input",
+                        "message": (
+                            f"Invalid resolution '{resolution}'. "
+                            f"Must be one of: {', '.join(sorted(valid_resolutions))}"
+                        ),
+                    }
+
+                edge = await self.edge_store.get_edge(edge_id)
+                if edge is None:
+                    return {
+                        "status": "error",
+                        "code": "not_found",
+                        "message": f"Edge '{edge_id}' not found",
+                    }
+
+                if edge["type"] != "contradicts":
+                    return {
+                        "status": "error",
+                        "code": "invalid_input",
+                        "message": (
+                            f"Edge '{edge_id}' is type '{edge['type']}', not 'contradicts'"
+                        ),
+                    }
+
+                from_id = str(edge["from_id"])
+                to_id = str(edge["to_id"])
+
+                loser_id: str | None = None
+                if resolution == "superseded":
+                    if winner_id is None:
+                        return {
+                            "status": "error",
+                            "code": "invalid_input",
+                            "message": "winner_id is required when resolution is 'superseded'",
+                        }
+                    if winner_id not in (from_id, to_id):
+                        return {
+                            "status": "error",
+                            "code": "invalid_input",
+                            "message": (
+                                f"winner_id '{winner_id}' must be either "
+                                f"from_id '{from_id}' or to_id '{to_id}'"
+                            ),
+                        }
+                    loser_id = to_id if winner_id == from_id else from_id
+
+                updated = await self.edge_store.update_conflict_resolution(
+                    edge_id,
+                    conflict_state=resolution,
+                    provenance_actor=resolver,
+                )
+
+                if not updated:
+                    return {
+                        "status": "error",
+                        "code": "update_failed",
+                        "message": f"Edge '{edge_id}' could not be updated",
+                    }
+
+                if resolution == "superseded" and winner_id is not None:
+                    await self.knowledge.update(
+                        id=winner_id,
+                        agent=resolver,
+                        supersedes=loser_id,
+                    )
+
+                from lithos.events import EDGE_UPSERTED
+
+                await self._emit(
+                    LithosEvent(
+                        type=EDGE_UPSERTED,
+                        payload={
+                            "edge_id": edge_id,
+                            "from_id": from_id,
+                            "to_id": to_id,
+                            "type": "contradicts",
+                            "conflict_state": resolution,
+                        },
+                    )
+                )
+
+                return {
+                    "status": "ok",
+                    "edge_id": edge_id,
+                    "conflict_state": resolution,
+                }
+
+        @self.mcp.tool()
+        @tool_metrics()
         async def lithos_cache_lookup(
             query: str,
             source_url: str | None = None,
@@ -2327,12 +2600,18 @@ class LithosServer:
         async def lithos_task_complete(
             task_id: str,
             agent: str,
+            cited_nodes: list[str] | None = None,
+            misleading_nodes: list[str] | None = None,
+            receipt_id: str | None = None,
         ) -> dict[str, Any]:
             """Mark a task as completed.
 
             Args:
                 task_id: Task ID
                 agent: Agent completing the task
+                cited_nodes: Node IDs the agent found useful (None = no feedback)
+                misleading_nodes: Node IDs the agent found misleading (None = no feedback)
+                receipt_id: Specific receipt to bind feedback to (optional)
 
             Returns:
                 Dict with success boolean, or error envelope if task not found or not open
@@ -2343,6 +2622,20 @@ class LithosServer:
                 span.set_attribute("lithos.tool", "lithos_task_complete")
                 span.set_attribute("lithos.agent", agent)
                 span.set_attribute("lithos.task_id", task_id)
+                # -- Validate feedback BEFORE completing the task --
+                feedback_supplied = cited_nodes is not None or misleading_nodes is not None
+                validated: dict[str, Any] | None = None
+                if feedback_supplied:
+                    error, validated = await self._validate_task_feedback(
+                        task_id=task_id,
+                        agent=agent,
+                        cited_nodes=cited_nodes,
+                        misleading_nodes=misleading_nodes,
+                        receipt_id=receipt_id,
+                    )
+                    if error is not None:
+                        return error
+
                 success = await self.coordination.complete_task(
                     task_id=task_id,
                     agent=agent,
@@ -2356,11 +2649,21 @@ class LithosServer:
                         "message": f"Task '{task_id}' not found or not in an open state.",
                     }
 
+                # -- Apply reinforcement side-effects after task is completed --
+                if validated is not None:
+                    await self._apply_task_feedback(validated)
+
                 await self._emit(
                     LithosEvent(
                         type=TASK_COMPLETED,
                         agent=agent,
-                        payload={"task_id": task_id, "agent": agent},
+                        payload={
+                            "task_id": task_id,
+                            "agent": agent,
+                            "cited_nodes": json.dumps(cited_nodes),
+                            "misleading_nodes": json.dumps(misleading_nodes),
+                            "receipt_id": json.dumps(receipt_id),
+                        },
                     )
                 )
 
@@ -2410,6 +2713,66 @@ class LithosServer:
                     "status": "error",
                     "code": "task_not_found",
                     "message": f"Task {task_id} not found or already closed",
+                }
+
+        @self.mcp.tool()
+        @tool_metrics()
+        async def lithos_node_stats(
+            node_id: str,
+        ) -> dict[str, Any]:
+            """View a note's salience score, retrieval stats, and penalty counts.
+
+            Args:
+                node_id: The document ID to look up stats for
+
+            Returns:
+                Dict with salience, retrieval_count, cited_count, ignored_count,
+                misleading_count, and other stats fields.
+                Returns error envelope if node_id does not match any known document.
+            """
+            logger.info("lithos_node_stats node_id=%s", node_id)
+            tracer = get_tracer()
+            with tracer.start_as_current_span("lithos.tool.node_stats") as span:
+                span.set_attribute("lithos.tool", "lithos_node_stats")
+                span.set_attribute("lithos.node_id", node_id)
+
+                # Verify node exists in knowledge manager
+                if node_id not in self.knowledge._meta_cache:
+                    return {
+                        "status": "error",
+                        "code": "doc_not_found",
+                        "message": f"Node '{node_id}' not found in knowledge base.",
+                    }
+
+                stats = await self.stats_store.get_node_stats(node_id)
+                if stats is None:
+                    # Node exists but has no stats row — return defaults
+                    return {
+                        "node_id": node_id,
+                        "salience": 0.5,
+                        "retrieval_count": 0,
+                        "cited_count": 0,
+                        "last_retrieved_at": None,
+                        "last_used_at": None,
+                        "ignored_count": 0,
+                        "misleading_count": 0,
+                        "decay_rate": 0.0,
+                        "spaced_rep_strength": 0.0,
+                        "last_decay_applied_at": None,
+                    }
+
+                return {
+                    "node_id": node_id,
+                    "salience": stats.get("salience", 0.5),
+                    "retrieval_count": stats.get("retrieval_count", 0),
+                    "cited_count": stats.get("cited_count", 0),
+                    "last_retrieved_at": stats.get("last_retrieved_at"),
+                    "last_used_at": stats.get("last_used_at"),
+                    "ignored_count": stats.get("ignored_count", 0),
+                    "misleading_count": stats.get("misleading_count", 0),
+                    "decay_rate": stats.get("decay_rate", 0.0),
+                    "spaced_rep_strength": stats.get("spaced_rep_strength", 0.0),
+                    "last_decay_applied_at": stats.get("last_decay_applied_at"),
                 }
 
         @self.mcp.tool()
@@ -2523,15 +2886,19 @@ class LithosServer:
                 )
                 span.set_attribute("lithos.finding_id", finding_id)
 
+                payload: dict[str, str | int | float | bool | None] = {
+                    "finding_id": finding_id,
+                    "task_id": task_id,
+                    "agent": agent,
+                }
+                if knowledge_id is not None:
+                    payload["knowledge_id"] = knowledge_id
+
                 await self._emit(
                     LithosEvent(
                         type=FINDING_POSTED,
                         agent=agent,
-                        payload={
-                            "finding_id": finding_id,
-                            "task_id": task_id,
-                            "agent": agent,
-                        },
+                        payload=payload,
                     )
                 )
 

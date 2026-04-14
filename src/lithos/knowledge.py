@@ -95,6 +95,7 @@ _KNOWN_METADATA_KEYS = frozenset(
         "note_type",
         "status",
         "summaries",
+        "entities",
     }
 )
 
@@ -257,6 +258,7 @@ class KnowledgeMetadata:
     )
     status: str | None = None  # active | archived | quarantined
     summaries: dict | None = None  # {short: str, long: str}
+    entities: list[str] = field(default_factory=list)
 
     @property
     def is_stale(self) -> bool:
@@ -305,6 +307,8 @@ class KnowledgeMetadata:
             result["status"] = self.status
         if self.summaries is not None:
             result["summaries"] = self.summaries
+        if self.entities:
+            result["entities"] = self.entities
         # Merge unknown fields — known keys always take precedence.
         for key, value in self.extra.items():
             if key not in result:
@@ -379,6 +383,7 @@ class KnowledgeMetadata:
             note_type=data.get("note_type"),
             status=data.get("status"),
             summaries=summaries,
+            entities=data.get("entities", []),
         )
 
 
@@ -573,6 +578,8 @@ class _CachedMeta:
     access_scope: str | None = None
     source: str | None = None
     note_type: str | None = None
+    status: str | None = None
+    source_url: str | None = None
 
 
 class _UnsetType:
@@ -700,6 +707,8 @@ class KnowledgeManager:
                     raw_source: str | None = post.metadata.get("source")  # type: ignore[assignment]
                     raw_note_type: str | None = post.metadata.get("note_type")  # type: ignore[assignment]
                     raw_namespace: str | None = post.metadata.get("namespace")  # type: ignore[assignment]
+                    raw_status: str | None = post.metadata.get("status")  # type: ignore[assignment]
+                    raw_source_url: str | None = post.metadata.get("source_url")  # type: ignore[assignment]
                     cached_namespace = (
                         raw_namespace
                         if isinstance(raw_namespace, str) and raw_namespace
@@ -718,6 +727,8 @@ class KnowledgeManager:
                         else None,
                         source=raw_source if isinstance(raw_source, str) else None,
                         note_type=raw_note_type if isinstance(raw_note_type, str) else None,
+                        status=raw_status if isinstance(raw_status, str) else None,
+                        source_url=raw_source_url if isinstance(raw_source_url, str) else None,
                     )
 
                     # Populate source_url -> id map
@@ -968,6 +979,8 @@ class KnowledgeManager:
                 access_scope=metadata.access_scope,
                 source=metadata.source,
                 note_type=metadata.note_type,
+                status=metadata.status,
+                source_url=metadata.source_url,
             )
 
             logger.info(
@@ -1086,6 +1099,8 @@ class KnowledgeManager:
         note_type: str | None | _UnsetType = _UNSET,
         lcma_status: str | None | _UnsetType = _UNSET,
         summaries: dict | None | _UnsetType = _UNSET,
+        supersedes: str | None | _UnsetType = _UNSET,
+        entities: list[str] | None | _UnsetType = _UNSET,
     ) -> WriteResult:
         """Update an existing document.
 
@@ -1256,6 +1271,10 @@ class KnowledgeManager:
             if not isinstance(source, _UnsetType):
                 doc.metadata.source = source
 
+            # Handle supersedes update
+            if not isinstance(supersedes, _UnsetType):
+                doc.metadata.supersedes = supersedes
+
             # Handle LCMA field updates — preserve existing when _UNSET
             if not isinstance(schema_version, _UnsetType):
                 doc.metadata.schema_version = schema_version
@@ -1278,6 +1297,8 @@ class KnowledgeManager:
                 doc.metadata.status = "active"
             if not isinstance(summaries, _UnsetType):
                 doc.metadata.summaries = summaries
+            if not isinstance(entities, _UnsetType):
+                doc.metadata.entities = entities if entities is not None else []
 
             # Update fields
             if content is not None:
@@ -1329,6 +1350,8 @@ class KnowledgeManager:
                 access_scope=doc.metadata.access_scope,
                 source=doc.metadata.source,
                 note_type=doc.metadata.note_type,
+                status=doc.metadata.status,
+                source_url=doc.metadata.source_url,
             )
 
             if logger.isEnabledFor(logging.INFO):
@@ -1409,16 +1432,22 @@ class KnowledgeManager:
         offset: int = 0,
         tags: list[str] | None = None,
         author: str | None = None,
+        exclude_status: list[str] | None = None,
     ) -> tuple[list[KnowledgeDocument], int]:
         """List all documents with optional filtering.
 
         Uses the in-memory metadata cache for filtering so only matching
         documents require a full disk read.
+
+        ``exclude_status`` filters out documents whose cached status is in
+        the given list (e.g. ``['quarantined']``).
         """
         matching_ids: list[str] = []
         normalized_since = _normalize_datetime(since) if since else None
 
         for doc_id, cached in self._meta_cache.items():
+            if exclude_status and cached.status in exclude_status:
+                continue
             if path_prefix and not str(cached.path).startswith(path_prefix):
                 continue
             if tags and not all(t in cached.tags for t in tags):
@@ -1625,6 +1654,8 @@ class KnowledgeManager:
             access_scope=metadata.access_scope,
             source=metadata.source,
             note_type=metadata.note_type,
+            status=metadata.status,
+            source_url=metadata.source_url,
         )
 
         return doc
