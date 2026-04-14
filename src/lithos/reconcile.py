@@ -101,6 +101,11 @@ async def _reconcile_indices(config: LithosConfig, dry_run: bool) -> dict[str, A
     actions: list[dict[str, Any]] = []
     failures: list[dict[str, Any]] = []
 
+    logger.info(
+        "reconcile indices started: dry_run=%s",
+        dry_run,
+        extra={"scope": "indices", "dry_run": dry_run},
+    )
     with tracer.start_as_current_span("lithos.reconcile.scan") as scan_span:
         scan_span.set_attribute("lithos.reconcile.scope", "indices")
         try:
@@ -199,6 +204,22 @@ async def _reconcile_indices(config: LithosConfig, dry_run: bool) -> dict[str, A
         status = "partial_failure"
 
     lithos_metrics.reconcile_ops.add(1, {"scope": "indices", "status": status})
+    logger.info(
+        "reconcile indices complete: status=%s scanned=%d repaired=%d failed=%d dry_run=%s",
+        status,
+        len(corpus_docs),
+        repaired,
+        n_failed,
+        dry_run,
+        extra={
+            "scope": "indices",
+            "status": status,
+            "scanned": len(corpus_docs),
+            "repaired": repaired,
+            "failed": n_failed,
+            "dry_run": dry_run,
+        },
+    )
     return _make_result(
         "indices",
         dry_run,
@@ -238,6 +259,12 @@ async def _reconcile_graph(config: LithosConfig, dry_run: bool) -> dict[str, Any
                 failures=[{"code": "internal_error", "detail": str(exc)}],
             )
 
+    logger.info(
+        "reconcile graph started: dry_run=%s corpus_count=%d",
+        dry_run,
+        len(corpus_docs),
+        extra={"scope": "graph", "dry_run": dry_run, "corpus_count": len(corpus_docs)},
+    )
     graph = KnowledgeGraph(config)
     with tracer.start_as_current_span("lithos.reconcile.diff") as diff_span:
         diff_span.set_attribute("lithos.reconcile.scope", "graph")
@@ -352,6 +379,22 @@ async def _reconcile_graph(config: LithosConfig, dry_run: bool) -> dict[str, Any
     status: ReconcileStatus = "failed" if n_failed > 0 else "ok"
 
     lithos_metrics.reconcile_ops.add(1, {"scope": "graph", "status": status})
+    logger.info(
+        "reconcile graph complete: status=%s scanned=%d repaired=%d failed=%d dry_run=%s",
+        status,
+        len(corpus_docs),
+        repaired,
+        n_failed,
+        dry_run,
+        extra={
+            "scope": "graph",
+            "status": status,
+            "scanned": len(corpus_docs),
+            "repaired": repaired,
+            "failed": n_failed,
+            "dry_run": dry_run,
+        },
+    )
     return _make_result(
         "graph",
         dry_run,
@@ -447,6 +490,12 @@ async def reconcile(
     cfg = config or get_config()
     tracer = get_tracer()
 
+    logger.info(
+        "reconcile: scope=%s dry_run=%s",
+        scope,
+        dry_run,
+        extra={"scope": scope, "dry_run": dry_run},
+    )
     with tracer.start_as_current_span("lithos.reconcile") as span:
         span.set_attribute("lithos.reconcile.scope", scope)
         span.set_attribute("lithos.reconcile.dry_run", dry_run)
@@ -548,4 +597,21 @@ async def reconcile(
             )
 
         span.set_attribute("lithos.reconcile.status", result["status"])
+        logger.info(
+            "reconcile complete: scope=%s status=%s scanned=%d repaired=%d failed=%d dry_run=%s",
+            result["scope"],
+            result["status"],
+            result["summary"]["scanned"],
+            result["summary"]["repaired"],
+            result["summary"]["failed"],
+            dry_run,
+            extra={
+                "scope": result["scope"],
+                "status": result["status"],
+                "scanned": result["summary"]["scanned"],
+                "repaired": result["summary"]["repaired"],
+                "failed": result["summary"]["failed"],
+                "dry_run": dry_run,
+            },
+        )
         return result

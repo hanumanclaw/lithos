@@ -1469,6 +1469,14 @@ class KnowledgeManager:
             except Exception:
                 pass
 
+        logger.debug(
+            "list_all: total=%d returned=%d offset=%d limit=%d",
+            total,
+            len(docs),
+            offset,
+            limit,
+            extra={"total": total, "returned": len(docs), "offset": offset, "limit": limit},
+        )
         return docs, total
 
     async def get_all_tags(self) -> dict[str, int]:

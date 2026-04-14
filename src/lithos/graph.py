@@ -104,6 +104,12 @@ class KnowledgeGraph:
             self._path_to_node = data.get("path_to_node", {})
             self._filename_to_nodes = data.get("filename_to_nodes", {})
             self._alias_to_node = data.get("alias_to_node", {})
+            logger.info(
+                "graph cache loaded: path=%s node_count=%d edge_count=%d",
+                cache_path,
+                self.node_count(),
+                self.edge_count(),
+            )
             return True
         except Exception:
             logger.exception("Failed to load graph cache")
@@ -114,6 +120,12 @@ class KnowledgeGraph:
         """Save graph to cache atomically (write to temp file, then rename)."""
         cache_path = self.graph_cache_path
         cache_path.parent.mkdir(parents=True, exist_ok=True)
+        logger.debug(
+            "graph save_cache: path=%s node_count=%d edge_count=%d",
+            cache_path,
+            self.node_count(),
+            self.edge_count(),
+        )
 
         graph_data = (
             nx.node_link_data(self._graph, edges="links") if self._graph is not None else {}
@@ -145,6 +157,14 @@ class KnowledgeGraph:
             doc: Document to add
         """
         node_id = doc.id
+        is_update = node_id in self.graph
+        logger.debug(
+            "graph add_document: doc_id=%s title=%r update=%s link_count=%d",
+            node_id,
+            doc.title,
+            is_update,
+            len(doc.links),
+        )
 
         # Remove existing node if present (to update)
         if node_id in self.graph:
@@ -286,6 +306,9 @@ class KnowledgeGraph:
         if node_id and node_id in self.graph:
             self._remove_node_lookups(node_id)
             self.graph.remove_node(node_id)
+            logger.info("graph remove_document: doc_id=%s", doc_id)
+        else:
+            logger.debug("graph remove_document: doc_id=%s not found (no-op)", doc_id)
 
     @traced("lithos.graph.resolve_link")
     def _resolve_link(self, target: str) -> str | None:

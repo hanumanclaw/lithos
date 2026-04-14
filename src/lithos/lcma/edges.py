@@ -169,6 +169,23 @@ class EdgeStore:
                         edge_id,
                     ),
                 )
+                logger.debug(
+                    "edge upsert (update): edge_id=%s from=%s to=%s type=%s ns=%s weight=%.3f",
+                    edge_id,
+                    from_id,
+                    to_id,
+                    edge_type,
+                    namespace,
+                    weight,
+                    extra={
+                        "edge_id": edge_id,
+                        "from_id": from_id,
+                        "to_id": to_id,
+                        "edge_type": edge_type,
+                        "namespace": namespace,
+                        "weight": weight,
+                    },
+                )
             else:
                 edge_id = _generate_edge_id()
                 await db.execute(
@@ -191,6 +208,23 @@ class EdgeStore:
                         evidence,
                         conflict_state,
                     ),
+                )
+                logger.info(
+                    "edge upsert (insert): edge_id=%s from=%s to=%s type=%s ns=%s weight=%.3f",
+                    edge_id,
+                    from_id,
+                    to_id,
+                    edge_type,
+                    namespace,
+                    weight,
+                    extra={
+                        "edge_id": edge_id,
+                        "from_id": from_id,
+                        "to_id": to_id,
+                        "edge_type": edge_type,
+                        "namespace": namespace,
+                        "weight": weight,
+                    },
                 )
             await db.commit()
         return edge_id
@@ -322,7 +356,14 @@ class EdgeStore:
                 f"DELETE FROM edges WHERE edge_id IN ({placeholders})", edge_ids
             )
             await db.commit()
-            return cursor.rowcount
+            deleted = cursor.rowcount
+            logger.info(
+                "edge delete_edges: requested=%d deleted=%d",
+                len(edge_ids),
+                deleted,
+                extra={"requested": len(edge_ids), "deleted": deleted},
+            )
+            return deleted
 
     async def adjust_weight(self, edge_id: str, delta: float) -> float | None:
         """Atomically adjust weight by *delta*, clamping to [0.0, 1.0].
@@ -494,6 +535,12 @@ async def _project_provenance_to_edges(
     removed_count = len(to_remove)
 
     if dry_run:
+        logger.info(
+            "provenance projection dry_run: to_create=%d to_remove=%d",
+            created_count,
+            removed_count,
+            extra={"to_create": created_count, "to_remove": removed_count, "dry_run": True},
+        )
         return {"created": created_count, "removed": removed_count}
 
     # Apply the create side of the diff.
@@ -512,4 +559,10 @@ async def _project_provenance_to_edges(
     if orphan_ids:
         await edge_store.delete_edges(edge_ids=orphan_ids)
 
+    logger.info(
+        "provenance projection applied: created=%d removed=%d",
+        created_count,
+        removed_count,
+        extra={"edges_created": created_count, "edges_removed": removed_count, "dry_run": False},
+    )
     return {"created": created_count, "removed": removed_count}
