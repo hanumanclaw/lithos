@@ -11,7 +11,6 @@ import asyncio
 import contextlib
 import logging
 import re
-import time
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
