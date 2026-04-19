@@ -63,6 +63,8 @@ Thumbs.db
 
 # Claude
 .claude
+.codex
+.sentry-native
 
 # Ruff stuff:
 .ruff_cache/
